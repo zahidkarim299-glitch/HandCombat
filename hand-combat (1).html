@@ -1,0 +1,1109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>⚔ HAND COMBAT</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:#000;overflow:hidden;width:100vw;height:100vh}
+  #videoEl{display:none;position:absolute}
+  #gameCanvas{display:block;width:100vw;height:100vh}
+  #loadMsg{
+    position:fixed;inset:0;display:flex;align-items:center;
+    justify-content:center;flex-direction:column;gap:16px;
+    background:#08081a;color:#7af;font:bold 1.5rem "Courier New",monospace;
+    z-index:10;text-align:center;padding:2rem;
+  }
+  #loadMsg p{font-size:0.9rem;color:#557;max-width:460px;line-height:1.6}
+  #loadMsg .spinner{
+    width:48px;height:48px;border:4px solid #223;
+    border-top-color:#4af;border-radius:50%;animation:spin .8s linear infinite;
+  }
+  @keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+
+<!-- Hidden video feed for MediaPipe -->
+<video id="videoEl" playsinline autoplay muted></video>
+<!-- All game graphics drawn here -->
+<canvas id="gameCanvas"></canvas>
+
+<!-- Loading overlay -->
+<div id="loadMsg">
+  <div class="spinner"></div>
+  <span>Loading Hand Combat…</span>
+  <p>Allow webcam access when prompted.<br>
+     Player 1 stands on the <b>LEFT</b> · Player 2 on the <b>RIGHT</b><br>
+     Uses your webcam — no data is sent anywhere.</p>
+</div>
+
+<!-- MediaPipe scripts -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+
+<script>
+'use strict';
+// ═══════════════════════════════════════════════════════════════
+//  ⚔  HAND COMBAT  ⚔
+//  Two-player browser fighting game using MediaPipe Hand Tracking
+//  Player 1 = LEFT side of webcam   |   Player 2 = RIGHT side
+// ═══════════════════════════════════════════════════════════════
+
+const video  = document.getElementById('videoEl');
+const canvas = document.getElementById('gameCanvas');
+const ctx    = canvas.getContext('2d');
+const loadEl = document.getElementById('loadMsg');
+
+// ── Canvas sizing ──────────────────────────────────────────────
+function resize(){
+  canvas.width  = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ═══════════════════════════════════════════════════════════════
+// CONFIG  — tweak damage / cooldowns here
+// ═══════════════════════════════════════════════════════════════
+const CFG = {
+  SWORD_DAMAGE    : 14,
+  SWORD_CD        : 1200,   // ms between sword hits
+  SWORD_RANGE     : 75,     // px proximity to trigger hit
+  ARROW_DAMAGE    : 22,
+  ARROW_SPEED     : 13,
+  ARROW_FIRE_RATE : 900,    // ms between arrow shots
+  SHOCK_DAMAGE    : 28,
+  SHOCK_CD        : 2000,
+  BEAM_DAMAGE     : 35,
+  BEAM_CD         : 3500,
+  BEAM_FRAMES     : 80,     // duration of power beam
+  SHIELD_RADIUS   : 68,
+  CLAP_DIST       : 190,    // px — max dist between wrists to count as clap
+  START_HP        : 100,
+};
+
+// ═══════════════════════════════════════════════════════════════
+// GAME STATE
+// ═══════════════════════════════════════════════════════════════
+const GAME = {
+  state   : 'WAITING',   // 'WAITING' | 'PLAYING' | 'GAMEOVER'
+  winner  : null,
+  shake   : 0,
+  flash   : { alpha: 0, color: '#fff' },
+  frame   : 0,
+};
+
+function makePlayer(id, color){
+  return {
+    id, color,
+    hp        : CFG.START_HP,
+    maxHp     : CFG.START_HP,
+    gesture   : 'NONE',
+    handPos   : null,      // {x,y} canvas coords of primary wrist
+    lm        : null,      // primary hand landmarks (array[21])
+    lm2       : null,      // secondary hand landmarks
+    isShield  : false,
+    weapon    : null,      // active Sword or Shield instance
+    lastSword : 0,         // timestamp of last sword hit dealt
+    arrowCD   : 0,
+    shockCD   : 0,
+    beamCD    : 0,
+  };
+}
+
+const P = {
+  1: makePlayer(1, '#00c8ff'),
+  2: makePlayer(2, '#ff5520'),
+};
+
+let projectiles = [];   // active Arrow instances
+let effects     = [];   // Shockwave, PowerBeam, HitRing instances
+
+// ═══════════════════════════════════════════════════════════════
+// GESTURE DETECTION
+// ═══════════════════════════════════════════════════════════════
+// MediaPipe landmark indices (tip / pip pairs):
+//   index=8/6, middle=12/10, ring=16/14, pinky=20/18
+
+function up(lm, tip, pip){ return lm[tip].y < lm[pip].y; }
+
+function detectGesture(lm){
+  if(!lm) return 'NONE';
+  const i = up(lm, 8,  6);
+  const m = up(lm, 12, 10);
+  const r = up(lm, 16, 14);
+  const p = up(lm, 20, 18);
+  const n = [i,m,r,p].filter(Boolean).length;
+  if(n === 0)                      return 'FIST';   // ⚔ Sword
+  if(n === 4)                      return 'PALM';   // 🛡 Shield
+  if(i && !m && !r && !p)          return 'POINT';  // 🏹 Arrow
+  return 'NONE';
+}
+
+// ═══════════════════════════════════════════════════════════════
+// WEAPON CLASSES
+// ═══════════════════════════════════════════════════════════════
+
+// ── Sword ────────────────────────────────────────────────────
+// Sword angle is calculated from wrist (LM 0) → middle finger base (LM 9)
+// so the blade always points in the natural direction of the hand.
+class Sword {
+  constructor(pid){
+    this.pid    = pid;
+    this.type   = 'SWORD';
+    this.age    = 0;
+    this.angle  = 0;       // radians — updated each frame from hand landmarks
+    this.wx     = 0;       // wrist canvas X
+    this.wy     = 0;       // wrist canvas Y
+    this.tx     = 0;       // blade tip X  (world coords, for hit detection)
+    this.ty     = 0;       // blade tip Y
+    this.trails = [];      // tip trail [{x,y,angle}] for motion blur
+    this.LENGTH = 148;     // blade length in pixels
+  }
+
+  update(){
+    this.age++;
+    const p  = P[this.pid];
+    const lm = p.lm;
+    if(!lm) return;
+
+    // ── Angle from wrist (LM 0) → middle-finger base (LM 9) ──
+    const wrist  = lm[0];
+    const midBase = lm[9];
+    const dx = (midBase.x - wrist.x) * canvas.width;
+    const dy = (midBase.y - wrist.y) * canvas.height;
+    this.angle = Math.atan2(dy, dx);   // pointing direction of the hand
+
+    // Wrist position in canvas space
+    this.wx = wrist.x * canvas.width;
+    this.wy = wrist.y * canvas.height;
+
+    // Blade tip = wrist + LENGTH along the hand direction
+    this.tx = this.wx + Math.cos(this.angle) * this.LENGTH;
+    this.ty = this.wy + Math.sin(this.angle) * this.LENGTH;
+
+    // Store trail sample at blade tip (world coords)
+    this.trails.push({ x: this.tx, y: this.ty, a: this.angle });
+    if(this.trails.length > 12) this.trails.shift();
+
+    // ── Hit detection at blade tip ────────────────────────────
+    const opp = P[this.pid === 1 ? 2 : 1];
+    if(opp.handPos && !opp.isShield){
+      const d = Math.hypot(this.tx - opp.handPos.x, this.ty - opp.handPos.y);
+      const now = performance.now();
+      if(d < CFG.SWORD_RANGE && now - p.lastSword > CFG.SWORD_CD){
+        p.lastSword = now;
+        hitPlayer(opp, CFG.SWORD_DAMAGE, p.color);
+        spawnRing(this.tx, this.ty, '#ffdd33', 50, false);
+      }
+    }
+  }
+
+  draw(){
+    if(!P[this.pid].lm) return;
+    const BLADE = this.LENGTH;
+    const GUARD = 30;   // cross-guard half-width
+
+    // ── Motion trail — ghost blades along recent tip path ─────
+    for(let i = 0; i < this.trails.length; i++){
+      const t   = this.trails[i];
+      const frac = (i + 1) / this.trails.length;
+      ctx.save();
+      ctx.globalAlpha = frac * 0.30;
+      ctx.translate(this.wx, this.wy);
+      ctx.rotate(t.a);
+      ctx.shadowBlur  = 4;
+      ctx.shadowColor = '#ffaa00';
+      ctx.strokeStyle = '#ffcc44';
+      ctx.lineWidth   = 3 * frac;
+      ctx.lineCap     = 'round';
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.lineTo(BLADE * frac, 0);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // ── Main blade (drawn in local space, rotated to hand angle) ─
+    ctx.save();
+    ctx.translate(this.wx, this.wy);
+    ctx.rotate(this.angle);
+
+    // Wide outer glow
+    ctx.shadowBlur  = 32;
+    ctx.shadowColor = '#ffaa00';
+    ctx.strokeStyle = '#ffdd44';
+    ctx.lineWidth   = 8;
+    ctx.lineCap     = 'round';
+    ctx.globalAlpha = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(BLADE, 0);
+    ctx.stroke();
+
+    // Bright white core
+    ctx.shadowBlur  = 10;
+    ctx.shadowColor = '#ffffff';
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth   = 2.5;
+    ctx.stroke();
+
+    // Tip sparkle — small diamond at blade tip
+    ctx.shadowBlur  = 20;
+    ctx.shadowColor = '#fffaaa';
+    ctx.strokeStyle = '#fffaaa';
+    ctx.lineWidth   = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(BLADE - 10,  0);
+    ctx.lineTo(BLADE,      -7);
+    ctx.lineTo(BLADE + 10,  0);
+    ctx.lineTo(BLADE,       7);
+    ctx.closePath();
+    ctx.fillStyle   = 'rgba(255,250,200,0.5)';
+    ctx.fill();
+    ctx.stroke();
+
+    // Cross-guard — perpendicular bar at 25 % along blade
+    const gx = BLADE * 0.22;
+    ctx.shadowBlur  = 14;
+    ctx.shadowColor = '#ffaa00';
+    ctx.strokeStyle = '#ffcc44';
+    ctx.lineWidth   = 5;
+    ctx.lineCap     = 'round';
+    ctx.beginPath();
+    ctx.moveTo(gx, -GUARD);
+    ctx.lineTo(gx,  GUARD);
+    ctx.stroke();
+
+    // Guard centre accent
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth   = 1.5;
+    ctx.shadowBlur  = 6;
+    ctx.shadowColor = '#ffffff';
+    ctx.beginPath();
+    ctx.moveTo(gx, -GUARD * 0.5);
+    ctx.lineTo(gx,  GUARD * 0.5);
+    ctx.stroke();
+
+    ctx.restore();
+  }
+}
+
+// ── Shield ────────────────────────────────────────────────────
+class Shield {
+  constructor(pid){
+    this.pid  = pid;
+    this.type = 'SHIELD';
+    this.age  = 0;
+    this.r    = CFG.SHIELD_RADIUS;
+  }
+
+  update(){
+    this.age++;
+    this.r = CFG.SHIELD_RADIUS + Math.sin(this.age * 0.12) * 9;
+  }
+
+  draw(){
+    const p = P[this.pid];
+    if(!p.handPos) return;
+    const { x, y } = p.handPos;
+    ctx.save();
+
+    // Main glow ring
+    ctx.shadowBlur  = 35;
+    ctx.shadowColor = p.color;
+    ctx.strokeStyle = p.color;
+    ctx.lineWidth   = 4;
+    ctx.globalAlpha = 0.9;
+    ctx.beginPath();
+    ctx.arc(x, y, this.r, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // Fill shimmer
+    ctx.globalAlpha = 0.1;
+    ctx.fillStyle   = p.color;
+    ctx.fill();
+
+    // Hexagonal inner pattern (rotates slowly)
+    ctx.globalAlpha = 0.35;
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth   = 1;
+    ctx.shadowBlur  = 4;
+    ctx.shadowColor = '#ffffff';
+    ctx.beginPath();
+    for(let k = 0; k < 6; k++){
+      const ang = (k / 6) * Math.PI * 2 + this.age * 0.018;
+      const px  = x + Math.cos(ang) * this.r * 0.55;
+      const py  = y + Math.sin(ang) * this.r * 0.55;
+      k === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+    ctx.stroke();
+
+    // Inner rings
+    [0.65, 0.38].forEach(f => {
+      ctx.globalAlpha  = 0.2;
+      ctx.strokeStyle  = p.color;
+      ctx.lineWidth    = 2;
+      ctx.beginPath();
+      ctx.arc(x, y, this.r * f, 0, Math.PI * 2);
+      ctx.stroke();
+    });
+
+    ctx.restore();
+  }
+}
+
+// ── Arrow projectile ──────────────────────────────────────────
+class Arrow {
+  constructor(pid, x, y){
+    this.pid    = pid;
+    this.x      = x;
+    this.y      = y;
+    this.vx     = CFG.ARROW_SPEED * (pid === 1 ? 1 : -1);
+    this.alive  = true;
+    this.trails = [];
+    this.type   = 'ARROW';
+  }
+
+  update(){
+    this.x += this.vx;
+    this.trails.push({ x: this.x, y: this.y });
+    if(this.trails.length > 18) this.trails.shift();
+    if(this.x < 0 || this.x > canvas.width){ this.alive = false; return; }
+
+    const opp = P[this.pid === 1 ? 2 : 1];
+    if(opp.handPos){
+      if(Math.hypot(this.x - opp.handPos.x, this.y - opp.handPos.y) < 58){
+        if(opp.isShield){
+          spawnRing(this.x, this.y, opp.color, 38, true);
+        } else {
+          hitPlayer(opp, CFG.ARROW_DAMAGE, P[this.pid].color);
+          spawnRing(this.x, this.y, P[this.pid].color, 50, false);
+        }
+        this.alive = false;
+      }
+    }
+  }
+
+  draw(){
+    const col = P[this.pid].color;
+    ctx.save();
+
+    // Energy trail
+    for(let i = 0; i < this.trails.length; i++){
+      const t = this.trails[i];
+      const a = i / this.trails.length;
+      ctx.globalAlpha = a * 0.65;
+      ctx.fillStyle   = col;
+      ctx.shadowBlur  = 10;
+      ctx.shadowColor = col;
+      ctx.beginPath();
+      ctx.arc(t.x, t.y, a * 5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Arrow head glow
+    ctx.globalAlpha = 1;
+    ctx.shadowBlur  = 20;
+    ctx.shadowColor = col;
+    ctx.strokeStyle = col;
+    ctx.lineWidth   = 3;
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, 10, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // Bright core
+    ctx.shadowBlur  = 8;
+    ctx.shadowColor = '#ffffff';
+    ctx.fillStyle   = '#ffffff';
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, 5, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.restore();
+  }
+}
+
+// ── Shockwave ─────────────────────────────────────────────────
+class Shockwave {
+  constructor(pid, cx, cy){
+    this.pid    = pid;
+    this.cx     = cx;
+    this.cy     = cy;
+    this.r      = 12;
+    this.maxR   = Math.max(canvas.width, canvas.height) * 0.55;
+    this.alive  = true;
+    this.hasHit = false;
+    this.type   = 'SHOCKWAVE';
+  }
+
+  update(){
+    this.r += 11;
+    if(this.r > this.maxR){ this.alive = false; return; }
+
+    if(!this.hasHit){
+      const opp = P[this.pid === 1 ? 2 : 1];
+      if(opp.handPos){
+        const d = Math.hypot(opp.handPos.x - this.cx, opp.handPos.y - this.cy);
+        if(Math.abs(d - this.r) < 30){
+          this.hasHit = true;
+          if(opp.isShield){
+            spawnRing(opp.handPos.x, opp.handPos.y, opp.color, 60, true);
+          } else {
+            hitPlayer(opp, CFG.SHOCK_DAMAGE, P[this.pid].color);
+            spawnRing(opp.handPos.x, opp.handPos.y, P[this.pid].color, 70, false);
+          }
+        }
+      }
+    }
+  }
+
+  draw(){
+    const col   = P[this.pid].color;
+    const alpha = Math.max(0, 1 - this.r / this.maxR);
+    ctx.save();
+    ctx.globalAlpha = alpha;
+
+    // Thick outer glow
+    ctx.shadowBlur  = 18;
+    ctx.shadowColor = col;
+    ctx.strokeStyle = col;
+    ctx.lineWidth   = 14;
+    ctx.globalAlpha = alpha * 0.22;
+    ctx.beginPath();
+    ctx.arc(this.cx, this.cy, this.r, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // Bright ring
+    ctx.lineWidth   = 4;
+    ctx.globalAlpha = alpha * 0.9;
+    ctx.stroke();
+
+    // Inner highlight
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth   = 1.5;
+    ctx.globalAlpha = alpha * 0.45;
+    ctx.shadowBlur  = 4;
+    ctx.stroke();
+
+    ctx.restore();
+  }
+}
+
+// ── Power Beam ────────────────────────────────────────────────
+class PowerBeam {
+  constructor(pid, y){
+    this.pid      = pid;
+    this.y        = y;
+    this.age      = 0;
+    this.alive    = true;
+    this.hitDone  = false;
+    this.w        = 22;        // beam width (pulses)
+    this.type     = 'BEAM';
+  }
+
+  update(){
+    this.age++;
+    if(this.age > CFG.BEAM_FRAMES){ this.alive = false; return; }
+    this.w = 20 + Math.sin(this.age * 0.28) * 12;
+
+    // Deal damage at midpoint of beam
+    if(!this.hitDone && this.age === Math.floor(CFG.BEAM_FRAMES * 0.45)){
+      const opp = P[this.pid === 1 ? 2 : 1];
+      if(opp.isShield && opp.handPos){
+        spawnRing(opp.handPos.x, opp.handPos.y, opp.color, 90, true);
+      } else {
+        hitPlayer(opp, CFG.BEAM_DAMAGE, P[this.pid].color);
+      }
+      this.hitDone = true;
+    }
+  }
+
+  draw(){
+    const p      = P[this.pid];
+    const pct    = this.age / CFG.BEAM_FRAMES;
+    const alpha  = 1 - pct;
+    const startX = this.pid === 1 ? 0 : canvas.width;
+    const endX   = this.pid === 1 ? canvas.width : 0;
+    ctx.save();
+
+    // Wide energy glow
+    const grad = ctx.createLinearGradient(startX, 0, endX, 0);
+    grad.addColorStop(0,   p.color);
+    grad.addColorStop(0.5, '#ffffff');
+    grad.addColorStop(1,   p.color);
+    ctx.globalAlpha = alpha * 0.28;
+    ctx.shadowBlur  = 40;
+    ctx.shadowColor = p.color;
+    ctx.strokeStyle = p.color;
+    ctx.lineWidth   = this.w + 30;
+    ctx.lineCap     = 'square';
+    ctx.beginPath();
+    ctx.moveTo(startX, this.y);
+    ctx.lineTo(endX, this.y);
+    ctx.stroke();
+
+    // Mid colored core
+    ctx.globalAlpha = alpha * 0.7;
+    ctx.strokeStyle = grad;
+    ctx.lineWidth   = this.w;
+    ctx.shadowBlur  = 20;
+    ctx.stroke();
+
+    // Bright white core
+    ctx.globalAlpha = alpha;
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth   = this.w * 0.3;
+    ctx.shadowBlur  = 6;
+    ctx.shadowColor = '#ffffff';
+    ctx.stroke();
+
+    ctx.restore();
+  }
+}
+
+// ── Hit Ring (impact flash) ───────────────────────────────────
+class HitRing {
+  constructor(x, y, color, maxR, blocked){
+    this.x = x; this.y = y; this.color = color;
+    this.r = 4; this.maxR = maxR;
+    this.blocked = blocked; this.alive = true; this.type = 'RING';
+  }
+  update(){ this.r += 5; if(this.r > this.maxR) this.alive = false; }
+  draw(){
+    const a = 1 - this.r / this.maxR;
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.shadowBlur  = 14;
+    ctx.shadowColor = this.color;
+    ctx.strokeStyle = this.color;
+    ctx.lineWidth   = this.blocked ? 5 : 3;
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, this.r, 0, Math.PI * 2);
+    ctx.stroke();
+    if(!this.blocked){
+      ctx.globalAlpha = a * 0.25;
+      ctx.lineWidth   = 12;
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════
+
+function hitPlayer(player, dmg, col){
+  if(GAME.state !== 'PLAYING') return;
+  player.hp   = Math.max(0, player.hp - dmg);
+  GAME.shake  = 13;
+  GAME.flash  = { alpha: 0.38, color: col };
+  if(player.hp <= 0){
+    GAME.state  = 'GAMEOVER';
+    GAME.winner = player.id === 1 ? 2 : 1;
+  }
+}
+
+function spawnRing(x, y, color, maxR, blocked){
+  effects.push(new HitRing(x, y, color, maxR, blocked));
+}
+
+function tryArrow(pid){
+  const p   = P[pid];
+  const now = performance.now();
+  if(p.handPos && now - p.arrowCD > CFG.ARROW_FIRE_RATE){
+    p.arrowCD = now;
+    projectiles.push(new Arrow(pid, p.handPos.x, p.handPos.y));
+  }
+}
+
+function tryShockwave(pid, cx, cy){
+  const p   = P[pid];
+  const now = performance.now();
+  if(now - p.shockCD > CFG.SHOCK_CD){
+    p.shockCD = now;
+    effects.push(new Shockwave(pid, cx, cy));
+    GAME.shake = 9;
+    GAME.flash = { alpha: 0.22, color: P[pid].color };
+  }
+}
+
+function tryBeam(pid, y){
+  const p   = P[pid];
+  const now = performance.now();
+  if(now - p.beamCD > CFG.BEAM_CD){
+    p.beamCD = now;
+    effects.push(new PowerBeam(pid, y));
+    GAME.shake = 18;
+    GAME.flash = { alpha: 0.5, color: P[pid].color };
+  }
+}
+
+function resetGame(){
+  P[1].hp = P[2].hp = CFG.START_HP;
+  P[1].weapon = P[2].weapon = null;
+  P[1].lastSword = P[2].lastSword = 0;
+  P[1].arrowCD   = P[2].arrowCD   = 0;
+  P[1].shockCD   = P[2].shockCD   = 0;
+  P[1].beamCD    = P[2].beamCD    = 0;
+  projectiles = []; effects = [];
+  GAME.state = 'PLAYING'; GAME.winner = null;
+  GAME.shake = 0; GAME.flash.alpha = 0;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MEDIAPIPE HAND TRACKING
+// ═══════════════════════════════════════════════════════════════
+
+const hands = new Hands({
+  locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`
+});
+
+hands.setOptions({
+  maxNumHands            : 4,    // up to 2 per player
+  modelComplexity        : 0,    // 0 = lite model (faster)
+  minDetectionConfidence : 0.7,
+  minTrackingConfidence  : 0.5,
+});
+
+hands.onResults(onResults);
+
+// Called each camera frame with MediaPipe hand landmark results
+function onResults(res){
+  // Clear player hand data
+  P[1].lm = P[1].lm2 = P[2].lm = P[2].lm2 = null;
+
+  if(!res.multiHandLandmarks || res.multiHandLandmarks.length === 0){
+    P[1].handPos = P[2].handPos = null;
+    P[1].gesture = P[2].gesture = 'NONE';
+    return;
+  }
+
+  // Assign each detected hand to a player based on wrist X position:
+  //   wrist.x < 0.5  →  Player 1 (left half of raw video feed)
+  //   wrist.x >= 0.5 →  Player 2 (right half)
+  res.multiHandLandmarks.forEach(lm => {
+    const wx = lm[0].x;
+    if(wx < 0.5){
+      if(!P[1].lm) P[1].lm = lm; else P[1].lm2 = lm;
+    } else {
+      if(!P[2].lm) P[2].lm = lm; else P[2].lm2 = lm;
+    }
+  });
+
+  processPlayer(1);
+  processPlayer(2);
+}
+
+function processPlayer(pid){
+  const p   = P[pid];
+  const lm  = p.lm;
+  const lm2 = p.lm2;
+
+  if(!lm){
+    p.handPos = null;
+    p.gesture = 'NONE';
+    p.isShield = false;
+    p.weapon   = null;
+    return;
+  }
+
+  // Primary wrist → canvas coordinates
+  p.handPos = { x: lm[0].x * canvas.width, y: lm[0].y * canvas.height };
+  p.gesture = detectGesture(lm);
+  p.isShield = (p.gesture === 'PALM');
+
+  // ── Two-hand specials (clap / power blast) ──────────────────
+  if(lm2){
+    const w1 = { x: lm[0].x  * canvas.width, y: lm[0].y  * canvas.height };
+    const w2 = { x: lm2[0].x * canvas.width, y: lm2[0].y * canvas.height };
+    const dist = Math.hypot(w1.x - w2.x, w1.y - w2.y);
+    const mid  = { x: (w1.x + w2.x) / 2, y: (w1.y + w2.y) / 2 };
+    const g2   = detectGesture(lm2);
+
+    if(dist < CFG.CLAP_DIST){
+      if(p.gesture === 'PALM' && g2 === 'PALM'){
+        // Both open palms close together → Power Blast Beam
+        tryBeam(pid, mid.y);
+      } else {
+        // Any clap gesture → Shockwave
+        tryShockwave(pid, mid.x, mid.y);
+      }
+    }
+
+    // Keep shielding if either hand is open
+    if(g2 === 'PALM') p.isShield = true;
+  }
+
+  // ── Single-hand weapon assignment ──────────────────────────
+  if(p.gesture === 'FIST'){
+    if(!p.weapon || p.weapon.type !== 'SWORD') p.weapon = new Sword(pid);
+  } else if(p.gesture === 'PALM'){
+    if(!p.weapon || p.weapon.type !== 'SHIELD') p.weapon = new Shield(pid);
+  } else if(p.gesture === 'POINT'){
+    p.weapon = null;
+    tryArrow(pid);
+  } else {
+    p.weapon = null;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CAMERA
+// ═══════════════════════════════════════════════════════════════
+const camera = new Camera(video, {
+  onFrame: async () => { await hands.send({ image: video }); },
+  width: 1280, height: 720,
+});
+camera.start().then(() => {
+  loadEl.style.display = 'none';
+}).catch(err => {
+  loadEl.innerHTML = `<span style="color:#f55">Webcam error: ${err.message}</span>
+    <p>Please allow camera access and reload the page.</p>`;
+});
+
+// ═══════════════════════════════════════════════════════════════
+// RENDERING
+// ═══════════════════════════════════════════════════════════════
+
+function drawBackground(){
+  // Dark gradient arena
+  const g = ctx.createLinearGradient(0, 0, 0, canvas.height);
+  g.addColorStop(0, '#090918');
+  g.addColorStop(1, '#030310');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Dim camera feed overlay
+  ctx.save();
+  ctx.globalAlpha = 0.13;
+  if(video.readyState >= 2) ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  ctx.restore();
+
+  // Player 1 (left) zone tint
+  ctx.save();
+  const zg1 = ctx.createLinearGradient(0, 0, canvas.width * 0.42, 0);
+  zg1.addColorStop(0, P[1].color + '1a');
+  zg1.addColorStop(1, 'transparent');
+  ctx.fillStyle = zg1;
+  ctx.fillRect(0, 0, canvas.width / 2, canvas.height);
+
+  // Player 2 (right) zone tint
+  const zg2 = ctx.createLinearGradient(canvas.width, 0, canvas.width * 0.58, 0);
+  zg2.addColorStop(0, P[2].color + '1a');
+  zg2.addColorStop(1, 'transparent');
+  ctx.fillStyle = zg2;
+  ctx.fillRect(canvas.width / 2, 0, canvas.width / 2, canvas.height);
+  ctx.restore();
+
+  // Center dashed divider
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255,255,255,0.07)';
+  ctx.lineWidth   = 2;
+  ctx.setLineDash([28, 14]);
+  ctx.beginPath();
+  ctx.moveTo(canvas.width / 2, 0);
+  ctx.lineTo(canvas.width / 2, canvas.height);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+
+  // Floor glow strip
+  ctx.save();
+  const fl = ctx.createLinearGradient(0, 0, canvas.width, 0);
+  fl.addColorStop(0,   P[1].color + 'cc');
+  fl.addColorStop(0.5, 'rgba(200,200,255,0.4)');
+  fl.addColorStop(1,   P[2].color + 'cc');
+  ctx.strokeStyle = fl;
+  ctx.lineWidth   = 2;
+  ctx.shadowBlur  = 18;
+  ctx.shadowColor = '#6688ff';
+  ctx.beginPath();
+  ctx.moveTo(0, canvas.height - 2);
+  ctx.lineTo(canvas.width, canvas.height - 2);
+  ctx.stroke();
+  ctx.restore();
+}
+
+// Draw MediaPipe hand skeleton for visual feedback
+function drawSkeleton(lm, color, alpha){
+  if(!lm) return;
+  const CONN = [
+    [0,1],[1,2],[2,3],[3,4],
+    [0,5],[5,6],[6,7],[7,8],
+    [0,9],[9,10],[10,11],[11,12],
+    [0,13],[13,14],[14,15],[15,16],
+    [0,17],[17,18],[18,19],[19,20],
+    [5,9],[9,13],[13,17],
+  ];
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.strokeStyle = color;
+  ctx.lineWidth   = 1.5;
+  ctx.shadowBlur  = 6;
+  ctx.shadowColor = color;
+  CONN.forEach(([a,b]) => {
+    ctx.beginPath();
+    ctx.moveTo(lm[a].x * canvas.width, lm[a].y * canvas.height);
+    ctx.lineTo(lm[b].x * canvas.width, lm[b].y * canvas.height);
+    ctx.stroke();
+  });
+  ctx.fillStyle = color;
+  lm.forEach(pt => {
+    ctx.beginPath();
+    ctx.arc(pt.x * canvas.width, pt.y * canvas.height, 2.5, 0, Math.PI * 2);
+    ctx.fill();
+  });
+  ctx.restore();
+}
+
+function drawHUD(){
+  const W   = canvas.width;
+  const bw  = Math.min(W * 0.33, 380);
+  const bh  = 22;
+  const pad = 16;
+
+  [1, 2].forEach(pid => {
+    const p   = P[pid];
+    const isL = pid === 1;
+    const bx  = isL ? pad : W - pad - bw;
+    const by  = pad;
+    const pct = p.hp / p.maxHp;
+
+    // Background panel
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(bx - 6, by - 6, bw + 12, bh + 38);
+
+    // HP bar fill — green → yellow → red
+    const hpCol = pct > 0.5 ? '#00ef88' : pct > 0.25 ? '#ffcc00' : '#ff2200';
+    ctx.shadowBlur  = 10;
+    ctx.shadowColor = hpCol;
+    ctx.fillStyle   = hpCol;
+    ctx.fillRect(bx, by, bw * pct, bh);
+
+    // HP bar border
+    ctx.shadowBlur  = 6;
+    ctx.shadowColor = p.color;
+    ctx.strokeStyle = p.color;
+    ctx.lineWidth   = 2;
+    ctx.strokeRect(bx, by, bw, bh);
+
+    // HP number centred on bar
+    ctx.shadowBlur  = 0;
+    ctx.font        = 'bold 11px "Courier New",monospace';
+    ctx.fillStyle   = '#ffffff';
+    ctx.textAlign   = 'center';
+    ctx.fillText(`${Math.ceil(p.hp)} / ${p.maxHp}`, bx + bw / 2, by + bh - 5);
+
+    // Player label
+    ctx.font        = 'bold 13px "Courier New",monospace';
+    ctx.fillStyle   = p.color;
+    ctx.shadowBlur  = 8;
+    ctx.shadowColor = p.color;
+    ctx.textAlign   = isL ? 'left' : 'right';
+    ctx.fillText(`PLAYER ${pid}`, isL ? bx : bx + bw, by + bh + 18);
+
+    // Active gesture icon
+    const icons = { FIST:'⚔', PALM:'🛡', POINT:'↗', NONE:'' };
+    ctx.font        = '17px Arial';
+    ctx.shadowBlur  = 0;
+    ctx.textAlign   = isL ? 'right' : 'left';
+    ctx.fillStyle   = '#ffffff';
+    ctx.fillText(icons[p.gesture] || '', isL ? bx + bw - 4 : bx + 4, by + bh - 3);
+
+    ctx.restore();
+  });
+
+  // VS badge
+  ctx.save();
+  ctx.font      = 'bold 13px "Courier New",monospace';
+  ctx.fillStyle = 'rgba(255,255,255,0.18)';
+  ctx.textAlign = 'center';
+  ctx.fillText('VS', W / 2, pad + bh - 5);
+  ctx.restore();
+}
+
+function drawGestureHints(){
+  // Subtle labels near hand positions during play
+  const icons = { FIST:'⚔ SWORD', PALM:'🛡 SHIELD', POINT:'↗ ARROW' };
+  [1, 2].forEach(pid => {
+    const p = P[pid];
+    if(!p.handPos || !icons[p.gesture]) return;
+    ctx.save();
+    ctx.font        = 'bold 14px Arial';
+    ctx.fillStyle   = P[pid].color;
+    ctx.shadowBlur  = 12;
+    ctx.shadowColor = P[pid].color;
+    ctx.textAlign   = 'center';
+    ctx.globalAlpha = 0.75;
+    ctx.fillText(icons[p.gesture], p.handPos.x, p.handPos.y - 65);
+    ctx.restore();
+  });
+}
+
+function drawWaiting(){
+  if(GAME.state !== 'WAITING') return;
+  const hasP1 = !!P[1].handPos;
+  const hasP2 = !!P[2].handPos;
+  if(hasP1 && hasP2){ GAME.state = 'PLAYING'; return; }
+
+  const W  = canvas.width;
+  const cy = canvas.height / 2;
+
+  // Overlay
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(0, 0, W, canvas.height);
+
+  // Title
+  const fs = Math.max(24, Math.round(W * 0.052));
+  ctx.font        = `bold ${fs}px "Courier New",monospace`;
+  ctx.textAlign   = 'center';
+  ctx.shadowBlur  = 45;
+  ctx.shadowColor = '#3388ff';
+  ctx.fillStyle   = '#ffffff';
+  ctx.fillText('⚔  HAND COMBAT  ⚔', W / 2, cy - 90);
+
+  // Sub
+  ctx.shadowBlur  = 0;
+  ctx.font        = `${Math.max(13, Math.round(W * 0.017))}px Arial`;
+  ctx.fillStyle   = 'rgba(180,210,255,0.75)';
+  ctx.fillText('Both players stand in front of the webcam', W / 2, cy - 42);
+  ctx.fillText('Player 1 → LEFT half    |    Player 2 → RIGHT half', W / 2, cy - 14);
+
+  // Gesture guide
+  const guide = [
+    ['✊  Fist',          '→  Summon Glowing Sword'],
+    ['🖐  Open Palm',     '→  Raise Energy Shield'],
+    ['☝  Point Finger',  '→  Shoot Energy Arrow'],
+    ['👏  Clap (2 hands)','→  Release Shockwave'],
+    ['🖐🖐  Both Palms', '→  Fire Power Blast Beam'],
+  ];
+  const gfs = Math.max(11, Math.round(W * 0.013));
+  ctx.font      = `${gfs}px Arial`;
+  ctx.fillStyle = 'rgba(160,200,255,0.55)';
+  guide.forEach(([g, a], i) => {
+    ctx.fillText(`${g}  ${a}`, W / 2, cy + 28 + i * 23);
+  });
+
+  // Ready status
+  [1, 2].forEach(pid => {
+    const has = pid === 1 ? hasP1 : hasP2;
+    const px  = pid === 1 ? W * 0.22 : W * 0.78;
+    ctx.font        = 'bold 16px Arial';
+    ctx.shadowBlur  = has ? 14 : 0;
+    ctx.shadowColor = '#00ff88';
+    ctx.fillStyle   = has ? '#00ff88' : '#ff4455';
+    ctx.fillText(`P${pid}: ${has ? '✓  READY' : '…waiting'}`, px, canvas.height * 0.86);
+  });
+
+  ctx.restore();
+}
+
+function drawGameOver(){
+  if(GAME.state !== 'GAMEOVER') return;
+  const w   = GAME.winner;
+  const col = P[w].color;
+
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.8)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const fs = Math.max(28, Math.round(canvas.width * 0.07));
+  ctx.font        = `bold ${fs}px "Courier New",monospace`;
+  ctx.textAlign   = 'center';
+  ctx.shadowBlur  = 60;
+  ctx.shadowColor = col;
+  ctx.fillStyle   = col;
+  ctx.fillText(`PLAYER ${w} WINS!`, canvas.width / 2, canvas.height / 2 - 24);
+
+  ctx.shadowBlur  = 15;
+  ctx.font        = `${Math.max(14, Math.round(canvas.width * 0.021))}px Arial`;
+  ctx.fillStyle   = 'rgba(255,255,255,0.65)';
+  ctx.fillText('Make a FIST to play again', canvas.width / 2, canvas.height / 2 + 50);
+
+  ctx.restore();
+
+  // Winning player makes a fist to restart
+  if(P[w].gesture === 'FIST') resetGame();
+}
+
+function applyScreenFX(){
+  // Screen shake
+  if(GAME.shake > 0.5){
+    ctx.translate(
+      (Math.random() - 0.5) * GAME.shake,
+      (Math.random() - 0.5) * GAME.shake
+    );
+    GAME.shake *= 0.78;
+  } else { GAME.shake = 0; }
+
+  // Hit flash
+  if(GAME.flash.alpha > 0.01){
+    ctx.save();
+    ctx.globalAlpha = GAME.flash.alpha;
+    ctx.fillStyle   = GAME.flash.color;
+    ctx.fillRect(-20, -20, canvas.width + 40, canvas.height + 40);
+    ctx.restore();
+    GAME.flash.alpha *= 0.82;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MAIN GAME LOOP — 60 FPS via requestAnimationFrame
+// ═══════════════════════════════════════════════════════════════
+function loop(){
+  requestAnimationFrame(loop);
+  GAME.frame++;
+
+  ctx.save();
+
+  drawBackground();
+  applyScreenFX();
+
+  // Draw hand skeletons (always, for player feedback)
+  drawSkeleton(P[1].lm,  P[1].color, 0.7);
+  drawSkeleton(P[1].lm2, P[1].color, 0.35);
+  drawSkeleton(P[2].lm,  P[2].color, 0.7);
+  drawSkeleton(P[2].lm2, P[2].color, 0.35);
+
+  if(GAME.state === 'PLAYING'){
+    // Update + draw active weapons
+    [1, 2].forEach(pid => {
+      const p = P[pid];
+      if(p.weapon){
+        p.weapon.update();
+        p.weapon.draw();
+        // Auto-drop weapon if gesture changed
+        if(p.weapon.type === 'SWORD'  && p.gesture !== 'FIST') p.weapon = null;
+        if(p.weapon.type === 'SHIELD' && p.gesture !== 'PALM') p.weapon = null;
+      }
+    });
+
+    // Update + draw projectiles (arrows)
+    projectiles = projectiles.filter(a => a.alive);
+    projectiles.forEach(a => { a.update(); a.draw(); });
+
+    // Update + draw effects (shockwave, beam, hit rings)
+    effects = effects.filter(e => e.alive);
+    effects.forEach(e => { e.update(); e.draw(); });
+
+    drawGestureHints();
+    drawHUD();
+  }
+
+  drawWaiting();
+  drawGameOver();
+
+  ctx.restore();
+}
+
+loop();
+</script>
+</body>
+</html>
