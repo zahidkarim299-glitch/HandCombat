@@ -5,13 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>⚔ HAND COMBAT</title>
 <style>
-  /* ── Base ────────────────────────────────────────────────────── */
   *{margin:0;padding:0;box-sizing:border-box}
   body{background:#000;overflow:hidden;width:100vw;height:100vh}
   #videoEl{display:none;position:absolute}
   #gameCanvas{display:block;width:100vw;height:100vh}
-
-  /* ── Loading screen ─────────────────────────────────────────── */
   #loadMsg{
     position:fixed;inset:0;display:flex;align-items:center;
     justify-content:center;flex-direction:column;gap:16px;
@@ -24,16 +21,25 @@
     border-top-color:#4af;border-radius:50%;animation:spin .8s linear infinite;
   }
   @keyframes spin{to{transform:rotate(360deg)}}
+
+  /* ── Sound status badge ── */
+  #soundBadge{
+    position:fixed;top:10px;right:12px;z-index:20;
+    display:flex;flex-direction:column;gap:3px;pointer-events:none;
+  }
+  .sbLine{
+    font:bold 11px "Courier New",monospace;
+    color:rgba(180,220,255,0.72);
+    text-align:right;letter-spacing:0.05em;
+    text-shadow:0 0 8px rgba(0,180,255,0.4);
+  }
 </style>
 </head>
 <body>
 
-<!-- Hidden video feed for MediaPipe — must NOT be mirrored here, raw coords needed -->
 <video id="videoEl" playsinline autoplay muted></video>
-<!-- All game graphics drawn here -->
 <canvas id="gameCanvas"></canvas>
 
-<!-- Loading overlay -->
 <div id="loadMsg">
   <div class="spinner"></div>
   <span>Loading Hand Combat…</span>
@@ -42,25 +48,31 @@
      Uses your webcam — no data is sent anywhere.</p>
 </div>
 
-<!-- MediaPipe scripts -->
+<!-- Sound toggle indicator (top-right) -->
+<div id="soundBadge">
+  <div class="sbLine" id="sbMusic">♪ MUSIC  [M]  ✔ ON</div>
+  <div class="sbLine" id="sbSfx">◈ SFX    [N]  ✔ ON</div>
+</div>
+
 <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
 <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
 
 <script>
 'use strict';
 // ╔═══════════════════════════════════════════════════════════════╗
-// ║  ⚔  HAND COMBAT  v2.0  ⚔                                    ║
-// ║  Two-player browser fighting game — MediaPipe Hand Tracking  ║
-// ║  Player 1 = LEFT side of webcam  |  Player 2 = RIGHT side   ║
+// ║  ⚔  HAND COMBAT  v2.1 — with Procedural Web Audio System    ║
+// ║  Two-player webcam fighting game · MediaPipe + WebAudio API  ║
 // ╚═══════════════════════════════════════════════════════════════╝
 
 // ════════════════════════════════════════════════════════════════
-//  SECTION 1 · DOM REFS & CANVAS SIZING
+//  §1  DOM REFS & CANVAS
 // ════════════════════════════════════════════════════════════════
-const video  = document.getElementById('videoEl');
-const canvas = document.getElementById('gameCanvas');
-const ctx    = canvas.getContext('2d');
-const loadEl = document.getElementById('loadMsg');
+const video   = document.getElementById('videoEl');
+const canvas  = document.getElementById('gameCanvas');
+const ctx     = canvas.getContext('2d');
+const loadEl  = document.getElementById('loadMsg');
+const sbMusic = document.getElementById('sbMusic');
+const sbSfx   = document.getElementById('sbSfx');
 
 function resize(){
   canvas.width  = window.innerWidth;
@@ -70,10 +82,10 @@ resize();
 window.addEventListener('resize', resize);
 
 // ════════════════════════════════════════════════════════════════
-//  SECTION 2 · CONFIG
+//  §2  CONFIG  — all tunable constants
 // ════════════════════════════════════════════════════════════════
 const CFG = {
-  // Combat
+  // ── Combat ───────────────────────────────────────────────────
   SWORD_DAMAGE    : 14,
   SWORD_CD        : 1200,   // ms between sword hits
   SWORD_RANGE     : 75,     // px proximity to trigger hit
@@ -86,77 +98,658 @@ const CFG = {
   BEAM_CD         : 3500,
   BEAM_FRAMES     : 80,     // duration of power beam in frames
   SHIELD_RADIUS   : 68,
-  CLAP_DIST       : 190,    // px — max dist between wrists to clap
+  CLAP_DIST       : 190,    // max wrist distance for clap gesture
   START_HP        : 100,
 
-  // Round system
-  ROUNDS_TO_WIN   : 2,      // best of 3
-  ROUND_RESET_DELAY: 180,   // frames pause between rounds
-
-  // Countdown
-  COUNTDOWN_START : 3,      // 3 → 2 → 1 → FIGHT
-
-  // Low health threshold
-  LOW_HP_THRESHOLD: 25,
-
-  // Performance
-  PERF_FPS_TARGET : 50,     // below this, enable performance mode
-  TRAIL_MAX       : 12,     // max trail samples (reduced in perf mode)
+  // ── Volume levels (0 – 1) ────────────────────────────────────
+  // Adjust these to balance the game's audio mix
+  VOL_MUSIC       : 0.18,   // BGM master — kept quieter than SFX
+  VOL_SFX_MASTER  : 0.80,   // SFX bus master
+  VOL_SWORD       : 0.55,
+  VOL_HIT         : 0.75,
+  VOL_SHIELD      : 0.50,
+  VOL_ARROW       : 0.45,
+  VOL_SHOCKWAVE   : 0.65,
+  VOL_BEAM        : 0.80,
+  VOL_KO          : 0.90,
+  VOL_ROUND_START : 0.70,
+  VOL_BEEP        : 0.60,
+  VOL_FIGHT       : 0.85,
 };
 
 // ════════════════════════════════════════════════════════════════
-//  SECTION 3 · GAME STATE
+//  §3  SOUND MANAGER
+//      100% procedural — no external audio files.
+//      All sounds synthesized with Web Audio API.
+//
+//  Architecture:
+//    AudioContext
+//      ├── musicGain  ──► destination   (background music)
+//      └── sfxGain    ──► destination   (all sound effects)
+//
+//  Per-SFX cooldowns prevent the same sound from overlapping
+//  too rapidly (e.g. rapid sword swings).
+// ════════════════════════════════════════════════════════════════
+const SND = (() => {
+
+  // ── State ────────────────────────────────────────────────────
+  let actx       = null;      // Web AudioContext (lazy-init)
+  let musicGain  = null;      // GainNode — BGM volume bus
+  let sfxGain    = null;      // GainNode — SFX volume bus
+  let musicNodes = null;      // Reference to running BGM nodes
+  let musicMuted = false;
+  let sfxMuted   = false;
+
+  // Per-SFX last-played timestamp (in AudioContext seconds)
+  const lastPlayed   = {};
+  // Minimum interval between identical sounds (seconds)
+  const MIN_INTERVAL = {
+    sword    : 0.10,
+    hit      : 0.08,
+    shield   : 0.15,
+    arrow    : 0.10,
+    shockwave: 0.30,
+    beam     : 0.60,
+    ko       : 0,
+    beep     : 0,
+    fight    : 0,
+    roundStart: 0,
+  };
+
+  // ── Init AudioContext on first user gesture ──────────────────
+  function init(){
+    if(actx) return;
+    actx = new (window.AudioContext || window.webkitAudioContext)();
+
+    // BGM bus
+    musicGain = actx.createGain();
+    musicGain.gain.value = musicMuted ? 0 : CFG.VOL_MUSIC;
+    musicGain.connect(actx.destination);
+
+    // SFX bus
+    sfxGain = actx.createGain();
+    sfxGain.gain.value = CFG.VOL_SFX_MASTER;
+    sfxGain.connect(actx.destination);
+
+    startBGM();
+    updateBadge();
+  }
+
+  // ── Helper: make a per-sound GainNode on the SFX bus ─────────
+  function mkSfx(vol){
+    const g = actx.createGain();
+    g.gain.value = vol;
+    g.connect(sfxGain);
+    return g;
+  }
+
+  // ── Cooldown gate: returns true only if sound is allowed ─────
+  function gate(name){
+    if(!actx || sfxMuted) return false;
+    const t   = actx.currentTime;
+    const gap = MIN_INTERVAL[name] || 0;
+    if(t - (lastPlayed[name] || 0) < gap) return false;
+    lastPlayed[name] = t;
+    return true;
+  }
+
+  // ════════════════════════════════════════════════════════════
+  //  BACKGROUND MUSIC
+  //  Layered synth loop: pad + bass pulse + hi-hat.
+  //  Uses only oscillators and noise buffers — no samples.
+  //  Loop is approximated by scheduling many repetitions ahead.
+  // ════════════════════════════════════════════════════════════
+  function startBGM(){
+    if(!actx || musicNodes) return;
+
+    const now  = actx.currentTime;
+    const BPM  = 126;
+    const BEAT = 60 / BPM;       // ~0.476 s
+    const BAR  = BEAT * 4;       // ~1.905 s
+    const REPS = 64;             // schedule this many repetitions ahead
+
+    // ── 1. PAD LAYER: two detuned sawtooth oscillators + LP filter ─
+    const padGain = actx.createGain();
+    padGain.gain.value = 0.10;
+
+    const lpf = actx.createBiquadFilter();
+    lpf.type           = 'lowpass';
+    lpf.frequency.value = 1100;
+    lpf.Q.value         = 1.6;
+
+    // Slow LFO sweeps the filter cutoff for motion
+    const lfo      = actx.createOscillator();
+    const lfoDepth = actx.createGain();
+    lfo.frequency.value  = 1 / (BAR * 4);   // one full sweep per 4 bars
+    lfoDepth.gain.value  = 700;
+    lfo.connect(lfoDepth);
+    lfoDepth.connect(lpf.frequency);
+    lfo.start(now);
+
+    // Pentatonic A-minor scale (two octaves)
+    const notes = [110, 130.81, 146.83, 164.81, 196, 220, 261.63, 293.66];
+    [0, 7].forEach(detune => {
+      const osc = actx.createOscillator();
+      osc.type = 'sawtooth';
+      osc.detune.value = detune;
+      // Step through notes, one per bar
+      notes.forEach((freq, i) => {
+        osc.frequency.setValueAtTime(freq, now + i * BAR);
+      });
+      // Loop the note pattern by repeating
+      for(let rep = 1; rep <= REPS; rep++){
+        notes.forEach((freq, i) => {
+          osc.frequency.setValueAtTime(freq, now + (rep * notes.length + i) * BAR);
+        });
+      }
+      osc.connect(lpf);
+      osc.start(now);
+    });
+
+    lpf.connect(padGain);
+    padGain.connect(musicGain);
+
+    // ── 2. BASS PULSE: low sine per beat ──────────────────────
+    const bassGain = actx.createGain();
+    bassGain.gain.value = 0.28;
+    // Bass note pattern (8 beats)
+    const bassPattern = [55, 55, 65.41, 55, 55, 73.42, 55, 61.74];
+
+    for(let rep = 0; rep < REPS * 2; rep++){
+      bassPattern.forEach((freq, bi) => {
+        const t = now + (rep * bassPattern.length + bi) * BEAT;
+        const osc = actx.createOscillator();
+        const env = actx.createGain();
+        osc.type = 'sine';
+        osc.frequency.value = freq;
+        env.gain.setValueAtTime(0, t);
+        env.gain.linearRampToValueAtTime(1.0, t + 0.012);
+        env.gain.exponentialRampToValueAtTime(0.001, t + BEAT * 0.65);
+        osc.connect(env);
+        env.connect(bassGain);
+        osc.start(t);
+        osc.stop(t + BEAT * 0.7);
+      });
+    }
+    bassGain.connect(musicGain);
+
+    // ── 3. HI-HAT: white noise bursts every half-beat ─────────
+    const hatGain = actx.createGain();
+    hatGain.gain.value = 0.055;
+    const hatLen = Math.ceil(actx.sampleRate * 0.04);
+    const hatBuf = actx.createBuffer(1, hatLen, actx.sampleRate);
+    const hatData = hatBuf.getChannelData(0);
+    for(let i = 0; i < hatLen; i++) hatData[i] = (Math.random() * 2 - 1) * (1 - i / hatLen);
+
+    for(let rep = 0; rep < REPS * 8; rep++){
+      const t      = now + rep * BEAT * 0.5;
+      const accent = rep % 2 === 0;
+      const src    = actx.createBufferSource();
+      src.buffer   = hatBuf;
+      const env    = actx.createGain();
+      env.gain.setValueAtTime(accent ? 0.9 : 0.4, t);
+      env.gain.exponentialRampToValueAtTime(0.001, t + 0.035);
+      src.connect(env);
+      env.connect(hatGain);
+      src.start(t);
+    }
+    hatGain.connect(musicGain);
+
+    musicNodes = { padGain, bassGain, hatGain };
+  }
+
+  // ════════════════════════════════════════════════════════════
+  //  SFX SYNTHESIZERS
+  // ════════════════════════════════════════════════════════════
+
+  /**
+   * ⚔ SWORD SWING
+   * Short noise whoosh (bandpass swept high→low) +
+   * metallic triangle ping. Sounds like an energy blade.
+   */
+  function playSword(){
+    if(!gate('sword')) return;
+    const now = actx.currentTime;
+    const out = mkSfx(CFG.VOL_SWORD);
+
+    // Whoosh: filtered noise
+    const bufLen = Math.ceil(actx.sampleRate * 0.18);
+    const buf    = actx.createBuffer(1, bufLen, actx.sampleRate);
+    const data   = buf.getChannelData(0);
+    for(let i = 0; i < bufLen; i++) data[i] = Math.random() * 2 - 1;
+    const noise  = actx.createBufferSource();
+    noise.buffer = buf;
+
+    const bpf = actx.createBiquadFilter();
+    bpf.type = 'bandpass'; bpf.Q.value = 1.8;
+    bpf.frequency.setValueAtTime(3400, now);
+    bpf.frequency.exponentialRampToValueAtTime(550, now + 0.15);
+
+    const wG = actx.createGain();
+    wG.gain.setValueAtTime(0.75, now);
+    wG.gain.exponentialRampToValueAtTime(0.001, now + 0.16);
+
+    noise.connect(bpf); bpf.connect(wG); wG.connect(out);
+    noise.start(now); noise.stop(now + 0.18);
+
+    // Metallic ping
+    const ping = actx.createOscillator();
+    ping.type = 'triangle';
+    ping.frequency.setValueAtTime(900, now);
+    ping.frequency.exponentialRampToValueAtTime(420, now + 0.13);
+    const pG = actx.createGain();
+    pG.gain.setValueAtTime(0.40, now);
+    pG.gain.exponentialRampToValueAtTime(0.001, now + 0.14);
+    ping.connect(pG); pG.connect(out);
+    ping.start(now); ping.stop(now + 0.15);
+  }
+
+  /**
+   * 💥 HIT / DAMAGE
+   * Low-freq kick thud + sharp high-freq crack.
+   * Classic fighting game impact.
+   */
+  function playHit(){
+    if(!gate('hit')) return;
+    const now = actx.currentTime;
+    const out = mkSfx(CFG.VOL_HIT);
+
+    // Body thud (pitch-dropping sine)
+    const thud = actx.createOscillator();
+    thud.type = 'sine';
+    thud.frequency.setValueAtTime(190, now);
+    thud.frequency.exponentialRampToValueAtTime(38, now + 0.13);
+    const tG = actx.createGain();
+    tG.gain.setValueAtTime(1.0, now);
+    tG.gain.exponentialRampToValueAtTime(0.001, now + 0.18);
+    thud.connect(tG); tG.connect(out);
+    thud.start(now); thud.stop(now + 0.20);
+
+    // Crack: brief HP noise burst
+    const cLen  = Math.ceil(actx.sampleRate * 0.06);
+    const cBuf  = actx.createBuffer(1, cLen, actx.sampleRate);
+    const cData = cBuf.getChannelData(0);
+    for(let i = 0; i < cLen; i++) cData[i] = (Math.random()*2-1) * Math.pow(1 - i/cLen, 2);
+    const csrc = actx.createBufferSource();
+    csrc.buffer = cBuf;
+    const chp = actx.createBiquadFilter();
+    chp.type = 'highpass'; chp.frequency.value = 1800;
+    const cG = actx.createGain();
+    cG.gain.setValueAtTime(0.85, now);
+    cG.gain.exponentialRampToValueAtTime(0.001, now + 0.055);
+    csrc.connect(chp); chp.connect(cG); cG.connect(out);
+    csrc.start(now);
+  }
+
+  /**
+   * 🛡 SHIELD BLOCK
+   * Resonant metallic bell clang (4 harmonic partials) +
+   * electric shimmer. Like a force-field repelling an attack.
+   */
+  function playShield(){
+    if(!gate('shield')) return;
+    const now = actx.currentTime;
+    const out = mkSfx(CFG.VOL_SHIELD);
+
+    // Bell partials
+    [440, 882, 1323, 1764].forEach((freq, i) => {
+      const osc = actx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.value = freq * (1 + i * 0.007);  // slight inharmonicity
+      const vols  = [0.60, 0.35, 0.18, 0.09];
+      const decays= [0.38, 0.32, 0.24, 0.18];
+      const g = actx.createGain();
+      g.gain.setValueAtTime(vols[i], now);
+      g.gain.exponentialRampToValueAtTime(0.001, now + decays[i]);
+      osc.connect(g); g.connect(out);
+      osc.start(now); osc.stop(now + decays[i] + 0.02);
+    });
+
+    // Electric shimmer
+    const shim = actx.createOscillator();
+    shim.type = 'sawtooth';
+    shim.frequency.setValueAtTime(2400, now);
+    shim.frequency.exponentialRampToValueAtTime(750, now + 0.24);
+    const shimBp = actx.createBiquadFilter();
+    shimBp.type = 'bandpass'; shimBp.frequency.value = 1900; shimBp.Q.value = 3;
+    const sG = actx.createGain();
+    sG.gain.setValueAtTime(0.22, now);
+    sG.gain.exponentialRampToValueAtTime(0.001, now + 0.22);
+    shim.connect(shimBp); shimBp.connect(sG); sG.connect(out);
+    shim.start(now); shim.stop(now + 0.26);
+  }
+
+  /**
+   * 🏹 ARROW SHOT
+   * Quick rising whistle + string-pluck twang.
+   */
+  function playArrow(){
+    if(!gate('arrow')) return;
+    const now = actx.currentTime;
+    const out = mkSfx(CFG.VOL_ARROW);
+
+    // Whistle sweep
+    const wh = actx.createOscillator();
+    wh.type = 'sine';
+    wh.frequency.setValueAtTime(550, now);
+    wh.frequency.exponentialRampToValueAtTime(1500, now + 0.08);
+    const wG = actx.createGain();
+    wG.gain.setValueAtTime(0.50, now);
+    wG.gain.exponentialRampToValueAtTime(0.001, now + 0.09);
+    wh.connect(wG); wG.connect(out);
+    wh.start(now); wh.stop(now + 0.10);
+
+    // Twang (plucked string feel)
+    const pl = actx.createOscillator();
+    pl.type = 'triangle';
+    pl.frequency.setValueAtTime(340, now);
+    pl.frequency.exponentialRampToValueAtTime(130, now + 0.13);
+    const plG = actx.createGain();
+    plG.gain.setValueAtTime(0.60, now);
+    plG.gain.exponentialRampToValueAtTime(0.001, now + 0.13);
+    pl.connect(plG); plG.connect(out);
+    pl.start(now); pl.stop(now + 0.14);
+  }
+
+  /**
+   * 💥 SHOCKWAVE
+   * Deep sub-bass rumble + wide noise burst.
+   * Earth-shaking ground pound feel.
+   */
+  function playShockwave(){
+    if(!gate('shockwave')) return;
+    const now = actx.currentTime;
+    const out = mkSfx(CFG.VOL_SHOCKWAVE);
+
+    // Sub bass rumble
+    const sub = actx.createOscillator();
+    sub.type = 'sine';
+    sub.frequency.setValueAtTime(85, now);
+    sub.frequency.exponentialRampToValueAtTime(22, now + 0.55);
+    const subG = actx.createGain();
+    subG.gain.setValueAtTime(1.0, now);
+    subG.gain.exponentialRampToValueAtTime(0.001, now + 0.60);
+    sub.connect(subG); subG.connect(out);
+    sub.start(now); sub.stop(now + 0.62);
+
+    // Wide noise burst
+    const nLen = Math.ceil(actx.sampleRate * 0.48);
+    const nBuf = actx.createBuffer(1, nLen, actx.sampleRate);
+    const nDat = nBuf.getChannelData(0);
+    for(let i = 0; i < nLen; i++) nDat[i] = Math.random() * 2 - 1;
+    const nsrc = actx.createBufferSource();
+    nsrc.buffer = nBuf;
+    const nlp = actx.createBiquadFilter();
+    nlp.type = 'lowpass';
+    nlp.frequency.setValueAtTime(1400, now);
+    nlp.frequency.exponentialRampToValueAtTime(180, now + 0.42);
+    const nG = actx.createGain();
+    nG.gain.setValueAtTime(0.55, now);
+    nG.gain.exponentialRampToValueAtTime(0.001, now + 0.42);
+    nsrc.connect(nlp); nlp.connect(nG); nG.connect(out);
+    nsrc.start(now); nsrc.stop(now + 0.48);
+  }
+
+  /**
+   * ⚡ POWER BEAM
+   * Rising charge sweep → sustained electric buzz with vibrato.
+   * Duration matches beam visual lifetime.
+   */
+  function playBeam(){
+    if(!gate('beam')) return;
+    const now = actx.currentTime;
+    const out = mkSfx(CFG.VOL_BEAM);
+    const dur = CFG.BEAM_FRAMES / 60;  // beam duration in seconds
+
+    // Charge sweep (0 → 0.35 s)
+    const ch = actx.createOscillator();
+    ch.type = 'sawtooth';
+    ch.frequency.setValueAtTime(100, now);
+    ch.frequency.exponentialRampToValueAtTime(2800, now + 0.34);
+    const chBp = actx.createBiquadFilter();
+    chBp.type = 'bandpass'; chBp.frequency.value = 900; chBp.Q.value = 2.2;
+    const chG = actx.createGain();
+    chG.gain.setValueAtTime(0, now);
+    chG.gain.linearRampToValueAtTime(0.85, now + 0.30);
+    chG.gain.exponentialRampToValueAtTime(0.001, now + 0.37);
+    ch.connect(chBp); chBp.connect(chG); chG.connect(out);
+    ch.start(now); ch.stop(now + 0.38);
+
+    // Sustained beam buzz
+    const buzz = actx.createOscillator();
+    buzz.type = 'square';
+    buzz.frequency.value = 175;
+    // Vibrato LFO on the buzz
+    const vibLfo   = actx.createOscillator();
+    const vibDepth = actx.createGain();
+    vibLfo.frequency.value = 16;
+    vibDepth.gain.value    = 22;
+    vibLfo.connect(vibDepth); vibDepth.connect(buzz.frequency);
+    vibLfo.start(now + 0.28); vibLfo.stop(now + dur);
+
+    const buzzLp = actx.createBiquadFilter();
+    buzzLp.type = 'lowpass'; buzzLp.frequency.value = 1100;
+    const bG = actx.createGain();
+    bG.gain.setValueAtTime(0, now + 0.27);
+    bG.gain.linearRampToValueAtTime(0.60, now + 0.38);
+    bG.gain.setValueAtTime(0.60, now + dur - 0.12);
+    bG.gain.exponentialRampToValueAtTime(0.001, now + dur);
+    buzz.connect(buzzLp); buzzLp.connect(bG); bG.connect(out);
+    buzz.start(now + 0.28); buzz.stop(now + dur + 0.05);
+  }
+
+  /**
+   * 💀 K.O.
+   * Three descending pitched hits + decaying noise tail.
+   * Dramatic fight-game KO sting.
+   */
+  function playKO(){
+    if(!gate('ko')) return;
+    const now = actx.currentTime;
+    const out = mkSfx(CFG.VOL_KO);
+
+    // Three descending hits
+    [[0, 440], [0.18, 330], [0.36, 220]].forEach(([dt, freq]) => {
+      const osc = actx.createOscillator();
+      osc.type = 'square';
+      osc.frequency.setValueAtTime(freq, now + dt);
+      osc.frequency.exponentialRampToValueAtTime(freq * 0.48, now + dt + 0.34);
+      const g = actx.createGain();
+      g.gain.setValueAtTime(0.65, now + dt);
+      g.gain.exponentialRampToValueAtTime(0.001, now + dt + 0.36);
+      osc.connect(g); g.connect(out);
+      osc.start(now + dt); osc.stop(now + dt + 0.38);
+    });
+
+    // Decay tail (reverb-like noise)
+    const tLen = Math.ceil(actx.sampleRate * 0.9);
+    const tBuf = actx.createBuffer(1, tLen, actx.sampleRate);
+    const tDat = tBuf.getChannelData(0);
+    for(let i = 0; i < tLen; i++) tDat[i] = (Math.random()*2-1) * Math.pow(1 - i/tLen, 3);
+    const tsrc = actx.createBufferSource();
+    tsrc.buffer = tBuf;
+    const tbp = actx.createBiquadFilter();
+    tbp.type = 'bandpass'; tbp.frequency.value = 750; tbp.Q.value = 0.6;
+    const tG = actx.createGain();
+    tG.gain.setValueAtTime(0.28, now + 0.35);
+    tG.gain.exponentialRampToValueAtTime(0.001, now + 0.95);
+    tsrc.connect(tbp); tbp.connect(tG); tG.connect(out);
+    tsrc.start(now + 0.35);
+  }
+
+  /**
+   * 🔔 COUNTDOWN BEEP  (step 0=3, 1=2, 2=1)
+   * Square wave tick — pitch rises with each step
+   * so 3 is low, 2 is mid, 1 is high.
+   */
+  function playBeep(step){
+    if(!actx || sfxMuted) return;
+    const now  = actx.currentTime;
+    const out  = mkSfx(CFG.VOL_BEEP);
+    const freq = [380, 500, 660][step] || 380;
+
+    const osc = actx.createOscillator();
+    osc.type = 'square';
+    osc.frequency.value = freq;
+    const g = actx.createGain();
+    g.gain.setValueAtTime(0.55, now);
+    g.gain.exponentialRampToValueAtTime(0.001, now + 0.20);
+    osc.connect(g); g.connect(out);
+    osc.start(now); osc.stop(now + 0.22);
+  }
+
+  /**
+   * ⚡ FIGHT! SOUND
+   * Energetic rising major-chord burst.
+   * Staggered attack on four harmonics for a punchy feel.
+   */
+  function playFight(){
+    if(!actx || sfxMuted) return;
+    const now = actx.currentTime;
+    const out = mkSfx(CFG.VOL_FIGHT);
+
+    // Staggered major chord (C major)
+    [523.25, 659.25, 783.99, 1046.50].forEach((freq, i) => {
+      const osc = actx.createOscillator();
+      osc.type = 'sawtooth';
+      osc.frequency.value = freq;
+      const g = actx.createGain();
+      g.gain.setValueAtTime(0, now + i * 0.022);
+      g.gain.linearRampToValueAtTime(0.32, now + i * 0.022 + 0.04);
+      g.gain.exponentialRampToValueAtTime(0.001, now + 0.58);
+      osc.connect(g); g.connect(out);
+      osc.start(now + i * 0.022); osc.stop(now + 0.62);
+    });
+
+    // Impact noise slam on beat 1
+    const sLen = Math.ceil(actx.sampleRate * 0.07);
+    const sBuf = actx.createBuffer(1, sLen, actx.sampleRate);
+    const sDat = sBuf.getChannelData(0);
+    for(let i = 0; i < sLen; i++) sDat[i] = (Math.random()*2-1) * (1 - i/sLen);
+    const ssrc = actx.createBufferSource();
+    ssrc.buffer = sBuf;
+    const sG = actx.createGain(); sG.gain.value = 0.55;
+    ssrc.connect(sG); sG.connect(out); ssrc.start(now);
+  }
+
+  /**
+   * 🔔 ROUND START CHIME
+   * Ascending two-note triangle chime.
+   */
+  function playRoundStart(){
+    if(!actx || sfxMuted) return;
+    const now = actx.currentTime;
+    const out = mkSfx(CFG.VOL_ROUND_START);
+
+    [[0, 392.00], [0.20, 523.25]].forEach(([dt, freq]) => {
+      const osc = actx.createOscillator();
+      osc.type = 'triangle';
+      osc.frequency.value = freq;
+      const g = actx.createGain();
+      g.gain.setValueAtTime(0.65, now + dt);
+      g.gain.exponentialRampToValueAtTime(0.001, now + dt + 0.32);
+      osc.connect(g); g.connect(out);
+      osc.start(now + dt); osc.stop(now + dt + 0.34);
+    });
+  }
+
+  // ════════════════════════════════════════════════════════════
+  //  MUTE / UNMUTE  (M = music, N = sfx)
+  // ════════════════════════════════════════════════════════════
+  function toggleMusic(){
+    if(!actx) { init(); return; }  // init audio on mute key press too
+    musicMuted = !musicMuted;
+    musicGain.gain.setTargetAtTime(
+      musicMuted ? 0 : CFG.VOL_MUSIC,
+      actx.currentTime, 0.08
+    );
+    updateBadge();
+  }
+
+  function toggleSfx(){
+    sfxMuted = !sfxMuted;
+    updateBadge();
+  }
+
+  function updateBadge(){
+    const mOn = !musicMuted;
+    const sOn = !sfxMuted;
+    sbMusic.textContent = `♪ MUSIC  [M]  ${mOn ? '✔ ON' : '✖ OFF'}`;
+    sbSfx.textContent   = `◈ SFX    [N]  ${sOn ? '✔ ON' : '✖ OFF'}`;
+    sbMusic.style.color = mOn ? 'rgba(180,220,255,0.72)' : 'rgba(255,90,90,0.72)';
+    sbSfx.style.color   = sOn ? 'rgba(180,220,255,0.72)' : 'rgba(255,90,90,0.72)';
+  }
+
+  // ── Public API ───────────────────────────────────────────────
+  return {
+    init,
+    sword       : playSword,
+    hit         : playHit,
+    shield      : playShield,
+    arrow       : playArrow,
+    shockwave   : playShockwave,
+    beam        : playBeam,
+    ko          : playKO,
+    beep        : playBeep,       // beep(step) — step 0,1,2
+    fight       : playFight,
+    roundStart  : playRoundStart,
+    toggleMusic,
+    toggleSfx,
+  };
+})();
+
+// ── Keyboard shortcuts ────────────────────────────────────────
+window.addEventListener('keydown', e => {
+  if(e.key==='m'||e.key==='M') SND.toggleMusic();
+  if(e.key==='n'||e.key==='N') SND.toggleSfx();
+});
+
+// ── Bootstrap AudioContext on first user gesture ──────────────
+//    Required by browser autoplay policy (no audio before interaction)
+let audioBooted = false;
+function bootAudio(){
+  if(audioBooted) return;
+  audioBooted = true;
+  SND.init();
+}
+['click','keydown','touchstart','mousedown'].forEach(ev =>
+  window.addEventListener(ev, bootAudio, { once: true, passive: true })
+);
+
+// ════════════════════════════════════════════════════════════════
+//  §4  GAME STATE
 // ════════════════════════════════════════════════════════════════
 const GAME = {
-  // Core state
-  state       : 'WAITING',  // 'WAITING' | 'COUNTDOWN' | 'PLAYING' | 'ROUND_END' | 'GAMEOVER'
-  winner      : null,       // pid of match winner
-
-  // Round tracking
-  roundNumber       : 1,
-  player1RoundsWon  : 0,
-  player2RoundsWon  : 0,
-  roundWinner       : null, // pid of round winner (null until round ends)
-  roundEndFrame     : 0,    // frame timestamp when round ended
-
-  // Countdown
-  countdownValue    : CFG.COUNTDOWN_START, // 3,2,1 then 'FIGHT'
-  countdownTimer    : 0,    // frames until next countdown step
-  fightDisplayFrames: 0,    // frames left to show "FIGHT!"
-
-  // Screen effects
-  shake       : 0,
-  flash       : { alpha: 0, color: '#fff' },
-
-  // Performance
-  frame       : 0,
-  lastFrameTime: performance.now(),
-  fps         : 60,
-  perfMode    : false,      // auto-enabled when fps drops
-  frameTimings: [],         // rolling buffer for FPS calc
-
-  // Damage gate — false during countdown
-  damageEnabled: false,
+  state  : 'WAITING',   // 'WAITING' | 'PLAYING' | 'GAMEOVER'
+  winner : null,
+  shake  : 0,
+  flash  : { alpha: 0, color: '#fff' },
+  frame  : 0,
 };
 
-// ════════════════════════════════════════════════════════════════
-//  SECTION 4 · PLAYER SYSTEM
-// ════════════════════════════════════════════════════════════════
+// Countdown state (3-2-1-FIGHT before match starts)
+const CD = {
+  active        : false,
+  value         : 3,       // current number shown
+  timer         : 0,       // frames until next decrement
+  fightFrames   : 0,       // frames left to show "FIGHT!"
+  // Beep already played for this countdown step?
+  beepPlayed    : false,
+  lastBeepStep  : -1,
+};
+
 function makePlayer(id, color){
   return {
     id, color,
     hp          : CFG.START_HP,
     maxHp       : CFG.START_HP,
     gesture     : 'NONE',
-    // FIX: gestureBuffer adds stability — require N consistent frames before changing gesture
-    gestureBuffer     : [],
-    gestureLock       : 'NONE',   // the confirmed stable gesture
-    handPos     : null,   // {x,y} canvas coords of primary wrist (LOGICAL coords, not mirrored)
-    lm          : null,   // primary hand landmarks (array[21])
-    lm2         : null,   // secondary hand landmarks
+    handPos     : null,
+    lm          : null,
+    lm2         : null,
     isShield    : false,
-    weapon      : null,   // active Sword or Shield instance
-    lastSword   : 0,      // timestamp of last sword hit dealt
+    weapon      : null,
+    lastSword   : 0,
     arrowCD     : 0,
     shockCD     : 0,
     beamCD      : 0,
@@ -168,89 +761,55 @@ const P = {
   2: makePlayer(2, '#ff5520'),
 };
 
-let projectiles = [];   // active Arrow instances
-let effects     = [];   // Shockwave, PowerBeam, HitRing instances
+let projectiles = [];
+let effects     = [];
 
 // ════════════════════════════════════════════════════════════════
-//  SECTION 5 · GESTURE SYSTEM
+//  §5  GESTURE DETECTION
 // ════════════════════════════════════════════════════════════════
-// MediaPipe landmark indices (tip / pip):
-//   index=8/6, middle=12/10, ring=16/14, pinky=20/18
-function fingerUp(lm, tip, pip){ return lm[tip].y < lm[pip].y; }
+function up(lm, tip, pip){ return lm[tip].y < lm[pip].y; }
 
 function detectGesture(lm){
   if(!lm) return 'NONE';
-  const i = fingerUp(lm,  8,  6);
-  const m = fingerUp(lm, 12, 10);
-  const r = fingerUp(lm, 16, 14);
-  const p = fingerUp(lm, 20, 18);
+  const i = up(lm,  8,  6);
+  const m = up(lm, 12, 10);
+  const r = up(lm, 16, 14);
+  const p = up(lm, 20, 18);
   const n = [i,m,r,p].filter(Boolean).length;
-  if(n === 0)             return 'FIST';   // ⚔ Sword
-  if(n === 4)             return 'PALM';   // 🛡 Shield
-  if(i && !m && !r && !p) return 'POINT';  // 🏹 Arrow
+  if(n === 0)              return 'FIST';
+  if(n === 4)              return 'PALM';
+  if(i && !m && !r && !p) return 'POINT';
   return 'NONE';
 }
 
-// Stabilise gesture: require 3 consistent readings before committing
-const GESTURE_BUFFER_SIZE = 3;
-function stableGesture(pid, raw){
-  const p = P[pid];
-  p.gestureBuffer.push(raw);
-  if(p.gestureBuffer.length > GESTURE_BUFFER_SIZE) p.gestureBuffer.shift();
-  // Only confirm if all recent readings agree
-  const allSame = p.gestureBuffer.every(g => g === p.gestureBuffer[0]);
-  if(allSame) p.gestureLock = p.gestureBuffer[0];
-  return p.gestureLock;
-}
-
 // ════════════════════════════════════════════════════════════════
-//  SECTION 6 · WEAPONS
+//  §6  WEAPON CLASSES
 // ════════════════════════════════════════════════════════════════
 
-// ── Sword ─────────────────────────────────────────────────────
 class Sword {
   constructor(pid){
-    this.pid    = pid;
-    this.type   = 'SWORD';
-    this.age    = 0;
-    this.angle  = 0;
-    this.wx     = 0;  // wrist canvas X  (logical, not display-mirrored)
-    this.wy     = 0;
-    this.tx     = 0;  // blade tip X
-    this.ty     = 0;
-    this.trails = [];
-    this.LENGTH = 148;
+    this.pid    = pid; this.type = 'SWORD'; this.age = 0;
+    this.angle  = 0; this.wx = 0; this.wy = 0; this.tx = 0; this.ty = 0;
+    this.trails = []; this.LENGTH = 148;
+    SND.sword();   // swing sound on weapon creation
   }
-
   update(){
     this.age++;
-    const p  = P[this.pid];
-    const lm = p.lm;
+    const p = P[this.pid], lm = p.lm;
     if(!lm) return;
-
-    // Angle from wrist (LM0) → middle finger base (LM9)
-    // NOTE: we use raw lm.x coords (0-1) as logical coords throughout.
-    //       The visual mirroring only happens when DRAWING the video frame.
-    const wrist   = lm[0];
-    const midBase = lm[9];
-    const dx = (midBase.x - wrist.x) * canvas.width;
-    const dy = (midBase.y - wrist.y) * canvas.height;
+    const wrist = lm[0], mid = lm[9];
+    const dx = (mid.x - wrist.x) * canvas.width;
+    const dy = (mid.y - wrist.y) * canvas.height;
     this.angle = Math.atan2(dy, dx);
-
-    this.wx = wrist.x * canvas.width;
-    this.wy = wrist.y * canvas.height;
+    this.wx = wrist.x * canvas.width; this.wy = wrist.y * canvas.height;
     this.tx = this.wx + Math.cos(this.angle) * this.LENGTH;
     this.ty = this.wy + Math.sin(this.angle) * this.LENGTH;
-
-    const maxTrail = GAME.perfMode ? 6 : CFG.TRAIL_MAX;
     this.trails.push({ x: this.tx, y: this.ty, a: this.angle });
-    if(this.trails.length > maxTrail) this.trails.shift();
-
-    // Hit detection — only when damage is enabled
-    if(!GAME.damageEnabled) return;
+    if(this.trails.length > 12) this.trails.shift();
+    // Hit detection
     const opp = P[this.pid === 1 ? 2 : 1];
     if(opp.handPos && !opp.isShield){
-      const d   = Math.hypot(this.tx - opp.handPos.x, this.ty - opp.handPos.y);
+      const d = Math.hypot(this.tx - opp.handPos.x, this.ty - opp.handPos.y);
       const now = performance.now();
       if(d < CFG.SWORD_RANGE && now - p.lastSword > CFG.SWORD_CD){
         p.lastSword = now;
@@ -259,1275 +818,635 @@ class Sword {
       }
     }
   }
-
   draw(){
     if(!P[this.pid].lm) return;
-    const BLADE = this.LENGTH;
-    const GUARD = 30;
-    const shadowSize = GAME.perfMode ? 10 : 32;
-
-    // Motion trail
+    const BLADE = this.LENGTH, GUARD = 30;
     for(let i = 0; i < this.trails.length; i++){
-      const t    = this.trails[i];
-      const frac = (i + 1) / this.trails.length;
-      ctx.save();
-      ctx.globalAlpha = frac * 0.30;
-      ctx.translate(this.wx, this.wy);
-      ctx.rotate(t.a);
-      ctx.shadowBlur  = GAME.perfMode ? 0 : 4;
-      ctx.shadowColor = '#ffaa00';
-      ctx.strokeStyle = '#ffcc44';
-      ctx.lineWidth   = 3 * frac;
-      ctx.lineCap     = 'round';
-      ctx.beginPath();
-      ctx.moveTo(0, 0);
-      ctx.lineTo(BLADE * frac, 0);
-      ctx.stroke();
+      const t = this.trails[i], frac = (i+1)/this.trails.length;
+      ctx.save(); ctx.globalAlpha = frac*0.30;
+      ctx.translate(this.wx, this.wy); ctx.rotate(t.a);
+      ctx.shadowBlur=4; ctx.shadowColor='#ffaa00';
+      ctx.strokeStyle='#ffcc44'; ctx.lineWidth=3*frac; ctx.lineCap='round';
+      ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(BLADE*frac,0); ctx.stroke();
       ctx.restore();
     }
-
-    ctx.save();
-    ctx.translate(this.wx, this.wy);
-    ctx.rotate(this.angle);
-
-    // Wide outer glow
-    ctx.shadowBlur  = shadowSize;
-    ctx.shadowColor = '#ffaa00';
-    ctx.strokeStyle = '#ffdd44';
-    ctx.lineWidth   = 8;
-    ctx.lineCap     = 'round';
-    ctx.globalAlpha = 1;
-    ctx.beginPath();
-    ctx.moveTo(0, 0);
-    ctx.lineTo(BLADE, 0);
+    ctx.save(); ctx.translate(this.wx,this.wy); ctx.rotate(this.angle);
+    ctx.shadowBlur=32; ctx.shadowColor='#ffaa00'; ctx.strokeStyle='#ffdd44';
+    ctx.lineWidth=8; ctx.lineCap='round'; ctx.globalAlpha=1;
+    ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(BLADE,0); ctx.stroke();
+    ctx.shadowBlur=10; ctx.shadowColor='#ffffff'; ctx.strokeStyle='#ffffff'; ctx.lineWidth=2.5;
     ctx.stroke();
-
-    // Bright white core
-    ctx.shadowBlur  = GAME.perfMode ? 4 : 10;
-    ctx.shadowColor = '#ffffff';
-    ctx.strokeStyle = '#ffffff';
-    ctx.lineWidth   = 2.5;
-    ctx.stroke();
-
-    // Tip sparkle
-    ctx.shadowBlur  = GAME.perfMode ? 8 : 20;
-    ctx.shadowColor = '#fffaaa';
-    ctx.strokeStyle = '#fffaaa';
-    ctx.lineWidth   = 1.5;
-    ctx.beginPath();
-    ctx.moveTo(BLADE - 10,  0);
-    ctx.lineTo(BLADE,      -7);
-    ctx.lineTo(BLADE + 10,  0);
-    ctx.lineTo(BLADE,       7);
-    ctx.closePath();
-    ctx.fillStyle = 'rgba(255,250,200,0.5)';
-    ctx.fill();
-    ctx.stroke();
-
-    // Cross-guard
-    const gx = BLADE * 0.22;
-    ctx.shadowBlur  = GAME.perfMode ? 6 : 14;
-    ctx.shadowColor = '#ffaa00';
-    ctx.strokeStyle = '#ffcc44';
-    ctx.lineWidth   = 5;
-    ctx.beginPath();
-    ctx.moveTo(gx, -GUARD);
-    ctx.lineTo(gx,  GUARD);
-    ctx.stroke();
-
-    ctx.strokeStyle = '#ffffff';
-    ctx.lineWidth   = 1.5;
-    ctx.shadowBlur  = 4;
-    ctx.shadowColor = '#ffffff';
-    ctx.beginPath();
-    ctx.moveTo(gx, -GUARD * 0.5);
-    ctx.lineTo(gx,  GUARD * 0.5);
-    ctx.stroke();
-
+    ctx.shadowBlur=20; ctx.shadowColor='#fffaaa'; ctx.strokeStyle='#fffaaa'; ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.moveTo(BLADE-10,0); ctx.lineTo(BLADE,-7);
+    ctx.lineTo(BLADE+10,0); ctx.lineTo(BLADE,7); ctx.closePath();
+    ctx.fillStyle='rgba(255,250,200,0.5)'; ctx.fill(); ctx.stroke();
+    const gx=BLADE*0.22;
+    ctx.shadowBlur=14; ctx.shadowColor='#ffaa00'; ctx.strokeStyle='#ffcc44'; ctx.lineWidth=5;
+    ctx.beginPath(); ctx.moveTo(gx,-GUARD); ctx.lineTo(gx,GUARD); ctx.stroke();
+    ctx.strokeStyle='#ffffff'; ctx.lineWidth=1.5; ctx.shadowBlur=6; ctx.shadowColor='#ffffff';
+    ctx.beginPath(); ctx.moveTo(gx,-GUARD*0.5); ctx.lineTo(gx,GUARD*0.5); ctx.stroke();
     ctx.restore();
   }
 }
 
-// ── Shield ────────────────────────────────────────────────────
 class Shield {
   constructor(pid){
-    this.pid  = pid;
-    this.type = 'SHIELD';
-    this.age  = 0;
-    this.r    = CFG.SHIELD_RADIUS;
+    this.pid=pid; this.type='SHIELD'; this.age=0; this.r=CFG.SHIELD_RADIUS;
   }
-
-  update(){
-    this.age++;
-    this.r = CFG.SHIELD_RADIUS + Math.sin(this.age * 0.12) * 9;
-  }
-
+  update(){ this.age++; this.r = CFG.SHIELD_RADIUS + Math.sin(this.age*0.12)*9; }
   draw(){
-    const p = P[this.pid];
-    if(!p.handPos) return;
-    const { x, y } = p.handPos;
-    const shadowSize = GAME.perfMode ? 12 : 35;
+    const p=P[this.pid]; if(!p.handPos) return;
+    const {x,y}=p.handPos;
     ctx.save();
-
-    ctx.shadowBlur  = shadowSize;
-    ctx.shadowColor = p.color;
-    ctx.strokeStyle = p.color;
-    ctx.lineWidth   = 4;
-    ctx.globalAlpha = 0.9;
+    ctx.shadowBlur=35; ctx.shadowColor=p.color; ctx.strokeStyle=p.color;
+    ctx.lineWidth=4; ctx.globalAlpha=0.9;
+    ctx.beginPath(); ctx.arc(x,y,this.r,0,Math.PI*2); ctx.stroke();
+    ctx.globalAlpha=0.1; ctx.fillStyle=p.color; ctx.fill();
+    ctx.globalAlpha=0.35; ctx.strokeStyle='#ffffff'; ctx.lineWidth=1;
+    ctx.shadowBlur=4; ctx.shadowColor='#ffffff';
     ctx.beginPath();
-    ctx.arc(x, y, this.r, 0, Math.PI * 2);
-    ctx.stroke();
-
-    ctx.globalAlpha = 0.1;
-    ctx.fillStyle   = p.color;
-    ctx.fill();
-
-    if(!GAME.perfMode){
-      // Hexagonal inner pattern
-      ctx.globalAlpha = 0.35;
-      ctx.strokeStyle = '#ffffff';
-      ctx.lineWidth   = 1;
-      ctx.shadowBlur  = 4;
-      ctx.shadowColor = '#ffffff';
-      ctx.beginPath();
-      for(let k = 0; k < 6; k++){
-        const ang = (k / 6) * Math.PI * 2 + this.age * 0.018;
-        const px  = x + Math.cos(ang) * this.r * 0.55;
-        const py  = y + Math.sin(ang) * this.r * 0.55;
-        k === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
-      }
-      ctx.closePath();
-      ctx.stroke();
-
-      [0.65, 0.38].forEach(f => {
-        ctx.globalAlpha = 0.2;
-        ctx.strokeStyle = p.color;
-        ctx.lineWidth   = 2;
-        ctx.beginPath();
-        ctx.arc(x, y, this.r * f, 0, Math.PI * 2);
-        ctx.stroke();
-      });
+    for(let k=0;k<6;k++){
+      const ang=(k/6)*Math.PI*2+this.age*0.018;
+      const px=x+Math.cos(ang)*this.r*0.55, py=y+Math.sin(ang)*this.r*0.55;
+      k===0?ctx.moveTo(px,py):ctx.lineTo(px,py);
     }
-
+    ctx.closePath(); ctx.stroke();
+    [0.65,0.38].forEach(f=>{
+      ctx.globalAlpha=0.2; ctx.strokeStyle=p.color; ctx.lineWidth=2;
+      ctx.beginPath(); ctx.arc(x,y,this.r*f,0,Math.PI*2); ctx.stroke();
+    });
     ctx.restore();
   }
 }
 
-// ── Arrow ─────────────────────────────────────────────────────
 class Arrow {
   constructor(pid, x, y){
-    this.pid    = pid;
-    this.x      = x;
-    this.y      = y;
-    this.vx     = CFG.ARROW_SPEED * (pid === 1 ? 1 : -1);
-    this.alive  = true;
-    this.hasHit = false;  // FIX: single-hit flag
-    this.trails = [];
-    this.type   = 'ARROW';
+    this.pid=pid; this.x=x; this.y=y;
+    this.vx=CFG.ARROW_SPEED*(pid===1?1:-1);
+    this.alive=true; this.trails=[]; this.type='ARROW';
+    SND.arrow();   // fire sound on spawn
   }
-
   update(){
-    if(!this.alive) return;
-    this.x += this.vx;
-    this.trails.push({ x: this.x, y: this.y });
-    const maxTrail = GAME.perfMode ? 8 : 18;
-    if(this.trails.length > maxTrail) this.trails.shift();
-    if(this.x < 0 || this.x > canvas.width){ this.alive = false; return; }
-
-    // FIX: check hasHit before damage to prevent multi-hit
-    if(!this.hasHit && GAME.damageEnabled){
-      const opp = P[this.pid === 1 ? 2 : 1];
-      if(opp.handPos){
-        if(Math.hypot(this.x - opp.handPos.x, this.y - opp.handPos.y) < 58){
-          this.hasHit = true;
-          this.alive  = false;  // FIX: immediately kill arrow on hit
-          if(opp.isShield){
-            spawnRing(this.x, this.y, opp.color, 38, true);
-          } else {
-            hitPlayer(opp, CFG.ARROW_DAMAGE, P[this.pid].color);
-            spawnRing(this.x, this.y, P[this.pid].color, 50, false);
-          }
+    this.x+=this.vx;
+    this.trails.push({x:this.x,y:this.y});
+    if(this.trails.length>18) this.trails.shift();
+    if(this.x<0||this.x>canvas.width){ this.alive=false; return; }
+    const opp=P[this.pid===1?2:1];
+    if(opp.handPos){
+      if(Math.hypot(this.x-opp.handPos.x, this.y-opp.handPos.y)<58){
+        if(opp.isShield){
+          SND.shield();    // block sound
+          spawnRing(this.x,this.y,opp.color,38,true);
+        } else {
+          hitPlayer(opp,CFG.ARROW_DAMAGE,P[this.pid].color);
+          spawnRing(this.x,this.y,P[this.pid].color,50,false);
         }
+        this.alive=false;
       }
     }
   }
-
   draw(){
-    if(!this.alive) return;
-    const col = P[this.pid].color;
+    const col=P[this.pid].color;
     ctx.save();
-
-    for(let i = 0; i < this.trails.length; i++){
-      const t = this.trails[i];
-      const a = i / this.trails.length;
-      ctx.globalAlpha = a * 0.65;
-      ctx.fillStyle   = col;
-      ctx.shadowBlur  = GAME.perfMode ? 4 : 10;
-      ctx.shadowColor = col;
-      ctx.beginPath();
-      ctx.arc(t.x, t.y, a * 5, 0, Math.PI * 2);
-      ctx.fill();
+    for(let i=0;i<this.trails.length;i++){
+      const t=this.trails[i],a=i/this.trails.length;
+      ctx.globalAlpha=a*0.65; ctx.fillStyle=col;
+      ctx.shadowBlur=10; ctx.shadowColor=col;
+      ctx.beginPath(); ctx.arc(t.x,t.y,a*5,0,Math.PI*2); ctx.fill();
     }
-
-    ctx.globalAlpha = 1;
-    ctx.shadowBlur  = GAME.perfMode ? 8 : 20;
-    ctx.shadowColor = col;
-    ctx.strokeStyle = col;
-    ctx.lineWidth   = 3;
-    ctx.beginPath();
-    ctx.arc(this.x, this.y, 10, 0, Math.PI * 2);
-    ctx.stroke();
-
-    ctx.shadowBlur  = GAME.perfMode ? 4 : 8;
-    ctx.shadowColor = '#ffffff';
-    ctx.fillStyle   = '#ffffff';
-    ctx.beginPath();
-    ctx.arc(this.x, this.y, 5, 0, Math.PI * 2);
-    ctx.fill();
-
+    ctx.globalAlpha=1; ctx.shadowBlur=20; ctx.shadowColor=col;
+    ctx.strokeStyle=col; ctx.lineWidth=3;
+    ctx.beginPath(); ctx.arc(this.x,this.y,10,0,Math.PI*2); ctx.stroke();
+    ctx.shadowBlur=8; ctx.shadowColor='#ffffff'; ctx.fillStyle='#ffffff';
+    ctx.beginPath(); ctx.arc(this.x,this.y,5,0,Math.PI*2); ctx.fill();
     ctx.restore();
   }
 }
 
-// ── Shockwave ─────────────────────────────────────────────────
 class Shockwave {
   constructor(pid, cx, cy){
-    this.pid    = pid;
-    this.cx     = cx;
-    this.cy     = cy;
-    this.r      = 12;
-    this.maxR   = Math.max(canvas.width, canvas.height) * 0.55;
-    this.alive  = true;
-    this.hasHit = false;
-    this.type   = 'SHOCKWAVE';
+    this.pid=pid; this.cx=cx; this.cy=cy; this.r=12;
+    this.maxR=Math.max(canvas.width,canvas.height)*0.55;
+    this.alive=true; this.hasHit=false; this.type='SHOCKWAVE';
+    SND.shockwave();   // shockwave launch sound
   }
-
   update(){
-    this.r += 11;
-    if(this.r > this.maxR){ this.alive = false; return; }
-
-    if(!this.hasHit && GAME.damageEnabled){
-      const opp = P[this.pid === 1 ? 2 : 1];
+    this.r+=11;
+    if(this.r>this.maxR){ this.alive=false; return; }
+    if(!this.hasHit){
+      const opp=P[this.pid===1?2:1];
       if(opp.handPos){
-        const d = Math.hypot(opp.handPos.x - this.cx, opp.handPos.y - this.cy);
-        if(Math.abs(d - this.r) < 30){
-          this.hasHit = true;
+        const d=Math.hypot(opp.handPos.x-this.cx, opp.handPos.y-this.cy);
+        if(Math.abs(d-this.r)<30){
+          this.hasHit=true;
           if(opp.isShield){
-            spawnRing(opp.handPos.x, opp.handPos.y, opp.color, 60, true);
+            SND.shield();   // block sound on shield intercept
+            spawnRing(opp.handPos.x,opp.handPos.y,opp.color,60,true);
           } else {
-            hitPlayer(opp, CFG.SHOCK_DAMAGE, P[this.pid].color);
-            spawnRing(opp.handPos.x, opp.handPos.y, P[this.pid].color, 70, false);
+            hitPlayer(opp,CFG.SHOCK_DAMAGE,P[this.pid].color);
+            spawnRing(opp.handPos.x,opp.handPos.y,P[this.pid].color,70,false);
           }
         }
       }
     }
   }
-
   draw(){
-    const col   = P[this.pid].color;
-    const alpha = Math.max(0, 1 - this.r / this.maxR);
-    ctx.save();
-
-    ctx.shadowBlur  = GAME.perfMode ? 8 : 18;
-    ctx.shadowColor = col;
-    ctx.strokeStyle = col;
-    ctx.lineWidth   = 14;
-    ctx.globalAlpha = alpha * 0.22;
-    ctx.beginPath();
-    ctx.arc(this.cx, this.cy, this.r, 0, Math.PI * 2);
-    ctx.stroke();
-
-    ctx.lineWidth   = 4;
-    ctx.globalAlpha = alpha * 0.9;
-    ctx.stroke();
-
-    ctx.strokeStyle = '#ffffff';
-    ctx.lineWidth   = 1.5;
-    ctx.globalAlpha = alpha * 0.45;
-    ctx.shadowBlur  = GAME.perfMode ? 2 : 4;
-    ctx.stroke();
-
+    const col=P[this.pid].color, alpha=Math.max(0,1-this.r/this.maxR);
+    ctx.save(); ctx.shadowBlur=18; ctx.shadowColor=col; ctx.strokeStyle=col;
+    ctx.lineWidth=14; ctx.globalAlpha=alpha*0.22;
+    ctx.beginPath(); ctx.arc(this.cx,this.cy,this.r,0,Math.PI*2); ctx.stroke();
+    ctx.lineWidth=4; ctx.globalAlpha=alpha*0.9; ctx.stroke();
+    ctx.strokeStyle='#ffffff'; ctx.lineWidth=1.5; ctx.globalAlpha=alpha*0.45;
+    ctx.shadowBlur=4; ctx.stroke();
     ctx.restore();
   }
 }
 
-// ── PowerBeam ─────────────────────────────────────────────────
 class PowerBeam {
   constructor(pid, y){
-    this.pid      = pid;
-    this.y        = y;
-    this.age      = 0;
-    this.alive    = true;
-    this.hitDone  = false;  // FIX: single-hit guaranteed
-    this.w        = 22;
-    this.type     = 'BEAM';
+    this.pid=pid; this.y=y; this.age=0; this.alive=true;
+    this.hitDone=false; this.w=22; this.type='BEAM';
+    SND.beam();   // beam charge + fire sound
   }
-
   update(){
     this.age++;
-    if(this.age > CFG.BEAM_FRAMES){ this.alive = false; return; }
-    this.w = 20 + Math.sin(this.age * 0.28) * 12;
-
-    // FIX: check damageEnabled + hitDone ensures exactly one damage event
-    if(!this.hitDone && GAME.damageEnabled &&
-       this.age === Math.floor(CFG.BEAM_FRAMES * 0.45)){
-      const opp = P[this.pid === 1 ? 2 : 1];
-      if(opp.isShield && opp.handPos){
-        spawnRing(opp.handPos.x, opp.handPos.y, opp.color, 90, true);
+    if(this.age>CFG.BEAM_FRAMES){ this.alive=false; return; }
+    this.w=20+Math.sin(this.age*0.28)*12;
+    if(!this.hitDone && this.age===Math.floor(CFG.BEAM_FRAMES*0.45)){
+      const opp=P[this.pid===1?2:1];
+      if(opp.isShield&&opp.handPos){
+        SND.shield();   // block
+        spawnRing(opp.handPos.x,opp.handPos.y,opp.color,90,true);
       } else {
-        hitPlayer(opp, CFG.BEAM_DAMAGE, P[this.pid].color);
+        hitPlayer(opp,CFG.BEAM_DAMAGE,P[this.pid].color);
       }
-      this.hitDone = true;
+      this.hitDone=true;
     }
   }
-
   draw(){
-    const p      = P[this.pid];
-    const pct    = this.age / CFG.BEAM_FRAMES;
-    const alpha  = 1 - pct;
-    const startX = this.pid === 1 ? 0 : canvas.width;
-    const endX   = this.pid === 1 ? canvas.width : 0;
+    const p=P[this.pid], pct=this.age/CFG.BEAM_FRAMES, alpha=1-pct;
+    const startX=this.pid===1?0:canvas.width, endX=this.pid===1?canvas.width:0;
     ctx.save();
-
-    const grad = ctx.createLinearGradient(startX, 0, endX, 0);
-    grad.addColorStop(0,   p.color);
-    grad.addColorStop(0.5, '#ffffff');
-    grad.addColorStop(1,   p.color);
-
-    ctx.globalAlpha = alpha * 0.28;
-    ctx.shadowBlur  = GAME.perfMode ? 16 : 40;
-    ctx.shadowColor = p.color;
-    ctx.strokeStyle = p.color;
-    ctx.lineWidth   = this.w + 30;
-    ctx.lineCap     = 'square';
-    ctx.beginPath();
-    ctx.moveTo(startX, this.y);
-    ctx.lineTo(endX, this.y);
-    ctx.stroke();
-
-    ctx.globalAlpha = alpha * 0.7;
-    ctx.strokeStyle = grad;
-    ctx.lineWidth   = this.w;
-    ctx.shadowBlur  = GAME.perfMode ? 8 : 20;
-    ctx.stroke();
-
-    ctx.globalAlpha = alpha;
-    ctx.strokeStyle = '#ffffff';
-    ctx.lineWidth   = this.w * 0.3;
-    ctx.shadowBlur  = GAME.perfMode ? 2 : 6;
-    ctx.shadowColor = '#ffffff';
-    ctx.stroke();
-
+    const grad=ctx.createLinearGradient(startX,0,endX,0);
+    grad.addColorStop(0,p.color); grad.addColorStop(0.5,'#ffffff'); grad.addColorStop(1,p.color);
+    ctx.globalAlpha=alpha*0.28; ctx.shadowBlur=40; ctx.shadowColor=p.color;
+    ctx.strokeStyle=p.color; ctx.lineWidth=this.w+30; ctx.lineCap='square';
+    ctx.beginPath(); ctx.moveTo(startX,this.y); ctx.lineTo(endX,this.y); ctx.stroke();
+    ctx.globalAlpha=alpha*0.7; ctx.strokeStyle=grad; ctx.lineWidth=this.w;
+    ctx.shadowBlur=20; ctx.stroke();
+    ctx.globalAlpha=alpha; ctx.strokeStyle='#ffffff'; ctx.lineWidth=this.w*0.3;
+    ctx.shadowBlur=6; ctx.shadowColor='#ffffff'; ctx.stroke();
     ctx.restore();
   }
 }
 
-// ── HitRing ───────────────────────────────────────────────────
 class HitRing {
-  constructor(x, y, color, maxR, blocked){
-    this.x = x; this.y = y; this.color = color;
-    this.r = 4; this.maxR = maxR;
-    this.blocked = blocked; this.alive = true; this.type = 'RING';
+  constructor(x,y,color,maxR,blocked){
+    this.x=x;this.y=y;this.color=color;this.r=4;this.maxR=maxR;
+    this.blocked=blocked;this.alive=true;this.type='RING';
   }
-  update(){ this.r += 5; if(this.r > this.maxR) this.alive = false; }
+  update(){ this.r+=5; if(this.r>this.maxR) this.alive=false; }
   draw(){
-    const a = 1 - this.r / this.maxR;
-    ctx.save();
-    ctx.globalAlpha = a;
-    ctx.shadowBlur  = GAME.perfMode ? 6 : 14;
-    ctx.shadowColor = this.color;
-    ctx.strokeStyle = this.color;
-    ctx.lineWidth   = this.blocked ? 5 : 3;
-    ctx.beginPath();
-    ctx.arc(this.x, this.y, this.r, 0, Math.PI * 2);
-    ctx.stroke();
-    if(!this.blocked){
-      ctx.globalAlpha = a * 0.25;
-      ctx.lineWidth   = 12;
-      ctx.stroke();
-    }
+    const a=1-this.r/this.maxR;
+    ctx.save(); ctx.globalAlpha=a; ctx.shadowBlur=14; ctx.shadowColor=this.color;
+    ctx.strokeStyle=this.color; ctx.lineWidth=this.blocked?5:3;
+    ctx.beginPath(); ctx.arc(this.x,this.y,this.r,0,Math.PI*2); ctx.stroke();
+    if(!this.blocked){ ctx.globalAlpha=a*0.25; ctx.lineWidth=12; ctx.stroke(); }
     ctx.restore();
   }
 }
 
 // ════════════════════════════════════════════════════════════════
-//  SECTION 7 · ROUND SYSTEM
-// ════════════════════════════════════════════════════════════════
-
-/**
- * Called when a player's HP hits 0.
- * Triggers ROUND_END → eventually GAMEOVER or next round.
- */
-function endRound(roundWinnerPid){
-  if(GAME.state === 'ROUND_END' || GAME.state === 'GAMEOVER') return;
-
-  GAME.state       = 'ROUND_END';
-  GAME.roundWinner = roundWinnerPid;
-  GAME.roundEndFrame = GAME.frame;
-
-  // Tally round win
-  if(roundWinnerPid === 1) GAME.player1RoundsWon++;
-  else                      GAME.player2RoundsWon++;
-
-  // Freeze all weapons + projectiles immediately
-  projectiles = [];
-  effects     = [];
-  [1,2].forEach(pid => { P[pid].weapon = null; });
-
-  GAME.shake = 18;
-  GAME.flash = { alpha: 0.6, color: P[roundWinnerPid].color };
-}
-
-/**
- * Advance to the next round or declare match winner.
- */
-function nextRoundOrEnd(){
-  const rw  = GAME.player1RoundsWon;
-  const r2  = GAME.player2RoundsWon;
-  const need = CFG.ROUNDS_TO_WIN;
-
-  if(rw >= need || r2 >= need){
-    // Match over
-    GAME.state  = 'GAMEOVER';
-    GAME.winner = rw >= need ? 1 : 2;
-  } else {
-    // Start next round
-    GAME.roundNumber++;
-    resetRound();
-    startCountdown();
-  }
-}
-
-/**
- * Reset per-round state (HP, projectiles, cooldowns) but NOT round scores.
- */
-function resetRound(){
-  [1,2].forEach(pid => {
-    P[pid].hp       = CFG.START_HP;
-    P[pid].weapon   = null;
-    P[pid].lastSword = 0;
-    P[pid].arrowCD  = 0;
-    P[pid].shockCD  = 0;
-    P[pid].beamCD   = 0;
-  });
-  projectiles = [];
-  effects     = [];
-  GAME.shake  = 0;
-  GAME.flash.alpha = 0;
-  GAME.roundWinner = null;
-  GAME.damageEnabled = false;
-}
-
-/**
- * Full match reset (called from GAMEOVER restart gesture).
- */
-function resetMatch(){
-  GAME.roundNumber      = 1;
-  GAME.player1RoundsWon = 0;
-  GAME.player2RoundsWon = 0;
-  GAME.winner           = null;
-  resetRound();
-  startCountdown();
-}
-
-/**
- * Begin the pre-round countdown (3-2-1-FIGHT).
- */
-function startCountdown(){
-  GAME.state              = 'COUNTDOWN';
-  GAME.countdownValue     = CFG.COUNTDOWN_START;
-  GAME.countdownTimer     = 75;  // ~1.25 sec per step at 60fps
-  GAME.fightDisplayFrames = 0;
-  GAME.damageEnabled      = false;
-}
-
-// ════════════════════════════════════════════════════════════════
-//  SECTION 8 · EFFECTS & HELPERS
+//  §7  HELPERS
 // ════════════════════════════════════════════════════════════════
 
 function hitPlayer(player, dmg, col){
   if(GAME.state !== 'PLAYING') return;
-  if(!GAME.damageEnabled) return;
-  // FIX: hard-clamp HP to prevent going below 0
-  player.hp = Math.max(0, player.hp - dmg);
+  player.hp  = Math.max(0, player.hp - dmg);
   GAME.shake = 13;
   GAME.flash = { alpha: 0.38, color: col };
   if(player.hp <= 0){
-    endRound(player.id === 1 ? 2 : 1);
+    SND.ko();           // KO sound — played once here
+    GAME.state  = 'GAMEOVER';
+    GAME.winner = player.id === 1 ? 2 : 1;
+  } else {
+    SND.hit();          // damage taken sound
   }
 }
 
-function spawnRing(x, y, color, maxR, blocked){
-  effects.push(new HitRing(x, y, color, maxR, blocked));
+function spawnRing(x,y,color,maxR,blocked){
+  effects.push(new HitRing(x,y,color,maxR,blocked));
 }
 
 function tryArrow(pid){
-  if(!GAME.damageEnabled) return;
-  const p   = P[pid];
-  const now = performance.now();
-  if(p.handPos && now - p.arrowCD > CFG.ARROW_FIRE_RATE){
-    p.arrowCD = now;
-    projectiles.push(new Arrow(pid, p.handPos.x, p.handPos.y));
+  const p=P[pid], now=performance.now();
+  if(p.handPos && now-p.arrowCD>CFG.ARROW_FIRE_RATE){
+    p.arrowCD=now;
+    projectiles.push(new Arrow(pid,p.handPos.x,p.handPos.y));
+    // Arrow SFX plays inside Arrow constructor
   }
 }
 
-function tryShockwave(pid, cx, cy){
-  if(!GAME.damageEnabled) return;
-  const p   = P[pid];
-  const now = performance.now();
-  if(now - p.shockCD > CFG.SHOCK_CD){
-    p.shockCD = now;
-    effects.push(new Shockwave(pid, cx, cy));
-    GAME.shake = 9;
-    GAME.flash = { alpha: 0.22, color: P[pid].color };
+function tryShockwave(pid,cx,cy){
+  const p=P[pid], now=performance.now();
+  if(now-p.shockCD>CFG.SHOCK_CD){
+    p.shockCD=now;
+    effects.push(new Shockwave(pid,cx,cy));
+    // SFX plays in Shockwave constructor
+    GAME.shake=9; GAME.flash={alpha:0.22,color:P[pid].color};
   }
 }
 
-function tryBeam(pid, y){
-  if(!GAME.damageEnabled) return;
-  const p   = P[pid];
-  const now = performance.now();
-  if(now - p.beamCD > CFG.BEAM_CD){
-    p.beamCD = now;
-    effects.push(new PowerBeam(pid, y));
-    GAME.shake = 18;
-    GAME.flash = { alpha: 0.5, color: P[pid].color };
+function tryBeam(pid,y){
+  const p=P[pid], now=performance.now();
+  if(now-p.beamCD>CFG.BEAM_CD){
+    p.beamCD=now;
+    effects.push(new PowerBeam(pid,y));
+    // SFX plays in PowerBeam constructor
+    GAME.shake=18; GAME.flash={alpha:0.5,color:P[pid].color};
+  }
+}
+
+function resetGame(){
+  [1,2].forEach(pid=>{
+    P[pid].hp=CFG.START_HP; P[pid].weapon=null;
+    P[pid].lastSword=P[pid].arrowCD=P[pid].shockCD=P[pid].beamCD=0;
+  });
+  projectiles=[]; effects=[];
+  GAME.state='PLAYING'; GAME.winner=null;
+  GAME.shake=0; GAME.flash.alpha=0;
+  SND.roundStart();   // chime on restart
+}
+
+// ── Countdown helpers ─────────────────────────────────────────
+function startCountdown(){
+  CD.active=true; CD.value=3; CD.timer=78;   // ~1.3 s per step
+  CD.fightFrames=0; CD.lastBeepStep=-1;
+  GAME.state='COUNTDOWN';
+}
+
+function updateCountdown(){
+  if(!CD.active) return;
+
+  if(CD.fightFrames > 0){
+    CD.fightFrames--;
+    if(CD.fightFrames === 0){
+      CD.active    = false;
+      GAME.state   = 'PLAYING';
+    }
+    return;
+  }
+
+  CD.timer--;
+  if(CD.timer <= 0){
+    CD.value--;
+    if(CD.value <= 0){
+      // Show FIGHT!
+      CD.fightFrames = 58;   // ~1 s
+      SND.fight();            // FIGHT! sound
+    } else {
+      CD.timer = 78;
+      // Beep for this step — step 0=3, 1=2, 2=1
+      const step = 3 - CD.value;   // 0,1,2
+      if(step !== CD.lastBeepStep){
+        CD.lastBeepStep = step;
+        SND.beep(step);
+      }
+    }
+  } else if(CD.timer === 77 && CD.value === 3){
+    // First beep (value=3, step=0) right when countdown starts
+    if(CD.lastBeepStep !== 0){
+      CD.lastBeepStep = 0;
+      SND.beep(0);
+    }
   }
 }
 
 // ════════════════════════════════════════════════════════════════
-//  SECTION 9 · MEDIAPIPE HAND TRACKING
+//  §8  MEDIAPIPE HAND TRACKING
 // ════════════════════════════════════════════════════════════════
-
 const hands = new Hands({
   locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`
 });
-
 hands.setOptions({
-  maxNumHands            : 4,
-  modelComplexity        : 0,    // Lite model (faster)
-  minDetectionConfidence : 0.7,
-  minTrackingConfidence  : 0.5,
+  maxNumHands:4, modelComplexity:0,
+  minDetectionConfidence:0.7, minTrackingConfidence:0.5,
 });
-
 hands.onResults(onResults);
 
-/**
- * Called each camera frame with MediaPipe hand results.
- *
- * CAMERA MIRROR FIX:
- *   MediaPipe receives the raw (un-mirrored) video feed.
- *   Player assignment uses RAW coords:  wrist.x < 0.5 → P1 (left of real camera)
- *   The game logic zones (hit detection, hand positions) stay in RAW coordinate space.
- *   ONLY the video DISPLAY is mirrored via ctx.scale(-1,1) in drawBackground().
- *   This means:
- *     - Players feel natural (moving left feels left in the mirror)
- *     - Zone assignment is still correct for the physical left/right split
- */
 function onResults(res){
-  P[1].lm = P[1].lm2 = P[2].lm = P[2].lm2 = null;
-
-  if(!res.multiHandLandmarks || res.multiHandLandmarks.length === 0){
-    P[1].handPos = P[2].handPos = null;
-    P[1].gesture = P[2].gesture = 'NONE';
+  P[1].lm=P[1].lm2=P[2].lm=P[2].lm2=null;
+  if(!res.multiHandLandmarks||res.multiHandLandmarks.length===0){
+    P[1].handPos=P[2].handPos=null;
+    P[1].gesture=P[2].gesture='NONE';
     return;
   }
-
-  // Assign each hand to a player based on RAW wrist X position
-  res.multiHandLandmarks.forEach(lm => {
-    const wx = lm[0].x;   // 0 = camera-left, 1 = camera-right (raw, not mirrored)
-    if(wx < 0.5){
-      if(!P[1].lm) P[1].lm = lm; else P[1].lm2 = lm;
-    } else {
-      if(!P[2].lm) P[2].lm = lm; else P[2].lm2 = lm;
-    }
+  res.multiHandLandmarks.forEach(lm=>{
+    const wx=lm[0].x;
+    if(wx<0.5){ if(!P[1].lm) P[1].lm=lm; else P[1].lm2=lm; }
+    else       { if(!P[2].lm) P[2].lm=lm; else P[2].lm2=lm; }
   });
-
-  processPlayer(1);
-  processPlayer(2);
+  processPlayer(1); processPlayer(2);
 }
 
 function processPlayer(pid){
-  const p   = P[pid];
-  const lm  = p.lm;
-  const lm2 = p.lm2;
+  const p=P[pid], lm=p.lm, lm2=p.lm2;
+  if(!lm){ p.handPos=null;p.gesture='NONE';p.isShield=false;p.weapon=null;return; }
 
-  if(!lm){
-    p.handPos  = null;
-    p.gesture  = 'NONE';
-    p.isShield = false;
-    // FIX: clean up weapon on hand-lost
-    p.weapon   = null;
-    return;
-  }
+  p.handPos={x:lm[0].x*canvas.width, y:lm[0].y*canvas.height};
+  p.gesture=detectGesture(lm);
+  p.isShield=(p.gesture==='PALM');
 
-  // Primary wrist → canvas coords (LOGICAL, un-mirrored space)
-  p.handPos = { x: lm[0].x * canvas.width, y: lm[0].y * canvas.height };
-
-  // Stabilised gesture
-  const rawGesture = detectGesture(lm);
-  p.gesture = stableGesture(pid, rawGesture);
-  p.isShield = (p.gesture === 'PALM');
-
-  // Two-hand specials
   if(lm2){
-    const w1 = { x: lm[0].x  * canvas.width, y: lm[0].y  * canvas.height };
-    const w2 = { x: lm2[0].x * canvas.width, y: lm2[0].y * canvas.height };
-    const dist = Math.hypot(w1.x - w2.x, w1.y - w2.y);
-    const mid  = { x: (w1.x + w2.x) / 2, y: (w1.y + w2.y) / 2 };
-    const g2   = detectGesture(lm2);
-
-    if(dist < CFG.CLAP_DIST){
-      if(p.gesture === 'PALM' && g2 === 'PALM'){
-        tryBeam(pid, mid.y);
-      } else {
-        // FIX: only try shockwave when damage is enabled to prevent shockwave spam on start
-        tryShockwave(pid, mid.x, mid.y);
-      }
+    const w1={x:lm[0].x*canvas.width,  y:lm[0].y*canvas.height};
+    const w2={x:lm2[0].x*canvas.width, y:lm2[0].y*canvas.height};
+    const dist=Math.hypot(w1.x-w2.x,w1.y-w2.y);
+    const mid={x:(w1.x+w2.x)/2,y:(w1.y+w2.y)/2};
+    const g2=detectGesture(lm2);
+    if(dist<CFG.CLAP_DIST){
+      if(p.gesture==='PALM'&&g2==='PALM') tryBeam(pid,mid.y);
+      else                                tryShockwave(pid,mid.x,mid.y);
     }
-    if(g2 === 'PALM') p.isShield = true;
+    if(g2==='PALM') p.isShield=true;
   }
 
-  // Single-hand weapon assignment
-  // FIX: only create a new weapon instance if type changed (prevents constant re-init)
-  if(p.gesture === 'FIST'){
-    if(!p.weapon || p.weapon.type !== 'SWORD') p.weapon = new Sword(pid);
-  } else if(p.gesture === 'PALM'){
-    if(!p.weapon || p.weapon.type !== 'SHIELD') p.weapon = new Shield(pid);
-  } else if(p.gesture === 'POINT'){
-    p.weapon = null;
-    tryArrow(pid);
+  if(p.gesture==='FIST'){
+    if(!p.weapon||p.weapon.type!=='SWORD') p.weapon=new Sword(pid);
+  } else if(p.gesture==='PALM'){
+    if(!p.weapon||p.weapon.type!=='SHIELD') p.weapon=new Shield(pid);
+  } else if(p.gesture==='POINT'){
+    p.weapon=null; tryArrow(pid);
   } else {
-    p.weapon = null;
+    p.weapon=null;
   }
 }
 
 // ════════════════════════════════════════════════════════════════
-//  SECTION 10 · PERFORMANCE MONITOR
-// ════════════════════════════════════════════════════════════════
-function updateFPS(){
-  const now = performance.now();
-  GAME.frameTimings.push(now);
-  // Keep a 1-second window
-  while(GAME.frameTimings.length > 1 &&
-        GAME.frameTimings[GAME.frameTimings.length - 1] - GAME.frameTimings[0] > 1000){
-    GAME.frameTimings.shift();
-  }
-  GAME.fps = GAME.frameTimings.length;
-  // Toggle perf mode
-  GAME.perfMode = GAME.fps < CFG.PERF_FPS_TARGET;
-}
-
-// ════════════════════════════════════════════════════════════════
-//  SECTION 11 · RENDERING
-// ════════════════════════════════════════════════════════════════
-
-/**
- * Draw the arena background.
- *
- * CAMERA MIRROR IMPLEMENTATION:
- *   We apply ctx.scale(-1, 1) + ctx.translate(-W, 0) ONLY for the video frame draw.
- *   All other rendering (weapons, UI, hands) uses normal coordinates.
- *   This mirrors only the VISUAL camera feed — not the gameplay coordinate system.
- */
-function drawBackground(){
-  const W = canvas.width;
-  const H = canvas.height;
-
-  // Dark gradient arena
-  const g = ctx.createLinearGradient(0, 0, 0, H);
-  g.addColorStop(0, '#090918');
-  g.addColorStop(1, '#030310');
-  ctx.fillStyle = g;
-  ctx.fillRect(0, 0, W, H);
-
-  // ── MIRRORED VIDEO DISPLAY ──────────────────────────────────
-  // scale(-1,1) flips horizontally around x=0, so we also translate(-W,0)
-  // to bring it back into view.
-  // This ONLY affects the video pixel draw — we save/restore ctx state.
-  if(video.readyState >= 2){
-    ctx.save();
-    ctx.globalAlpha = 0.13;
-    // Mirror transform: flip around the canvas centre-X
-    ctx.translate(W, 0);
-    ctx.scale(-1, 1);
-    ctx.drawImage(video, 0, 0, W, H);
-    ctx.restore();
-  }
-
-  // Player zone tints (unchanged — logical space)
-  ctx.save();
-  const zg1 = ctx.createLinearGradient(0, 0, W * 0.42, 0);
-  zg1.addColorStop(0, P[1].color + '1a');
-  zg1.addColorStop(1, 'transparent');
-  ctx.fillStyle = zg1;
-  ctx.fillRect(0, 0, W / 2, H);
-
-  const zg2 = ctx.createLinearGradient(W, 0, W * 0.58, 0);
-  zg2.addColorStop(0, P[2].color + '1a');
-  zg2.addColorStop(1, 'transparent');
-  ctx.fillStyle = zg2;
-  ctx.fillRect(W / 2, 0, W / 2, H);
-  ctx.restore();
-
-  // Center divider
-  ctx.save();
-  ctx.strokeStyle = 'rgba(255,255,255,0.07)';
-  ctx.lineWidth   = 2;
-  ctx.setLineDash([28, 14]);
-  ctx.beginPath();
-  ctx.moveTo(W / 2, 0);
-  ctx.lineTo(W / 2, H);
-  ctx.stroke();
-  ctx.setLineDash([]);
-  ctx.restore();
-
-  // Floor glow
-  ctx.save();
-  const fl = ctx.createLinearGradient(0, 0, W, 0);
-  fl.addColorStop(0,   P[1].color + 'cc');
-  fl.addColorStop(0.5, 'rgba(200,200,255,0.4)');
-  fl.addColorStop(1,   P[2].color + 'cc');
-  ctx.strokeStyle = fl;
-  ctx.lineWidth   = 2;
-  ctx.shadowBlur  = GAME.perfMode ? 8 : 18;
-  ctx.shadowColor = '#6688ff';
-  ctx.beginPath();
-  ctx.moveTo(0, H - 2);
-  ctx.lineTo(W, H - 2);
-  ctx.stroke();
-  ctx.restore();
-}
-
-// Draw MediaPipe hand skeleton
-function drawSkeleton(lm, color, alpha){
-  if(!lm) return;
-  const CONN = [
-    [0,1],[1,2],[2,3],[3,4],
-    [0,5],[5,6],[6,7],[7,8],
-    [0,9],[9,10],[10,11],[11,12],
-    [0,13],[13,14],[14,15],[15,16],
-    [0,17],[17,18],[18,19],[19,20],
-    [5,9],[9,13],[13,17],
-  ];
-  ctx.save();
-  ctx.globalAlpha = alpha;
-  ctx.strokeStyle = color;
-  ctx.lineWidth   = 1.5;
-  ctx.shadowBlur  = GAME.perfMode ? 2 : 6;
-  ctx.shadowColor = color;
-  CONN.forEach(([a,b]) => {
-    ctx.beginPath();
-    ctx.moveTo(lm[a].x * canvas.width, lm[a].y * canvas.height);
-    ctx.lineTo(lm[b].x * canvas.width, lm[b].y * canvas.height);
-    ctx.stroke();
-  });
-  ctx.fillStyle = color;
-  lm.forEach(pt => {
-    ctx.beginPath();
-    ctx.arc(pt.x * canvas.width, pt.y * canvas.height, 2.5, 0, Math.PI * 2);
-    ctx.fill();
-  });
-  ctx.restore();
-}
-
-// ── HUD ───────────────────────────────────────────────────────
-function drawHUD(){
-  const W   = canvas.width;
-  const bw  = Math.min(W * 0.33, 380);
-  const bh  = 22;
-  const pad = 16;
-
-  [1, 2].forEach(pid => {
-    const p   = P[pid];
-    const isL = pid === 1;
-    const bx  = isL ? pad : W - pad - bw;
-    const by  = pad + 28;   // shift down to make room for round display
-    const pct = p.hp / p.maxHp;
-
-    ctx.save();
-    ctx.fillStyle = 'rgba(0,0,0,0.55)';
-    ctx.fillRect(bx - 6, by - 6, bw + 12, bh + 38);
-
-    const hpCol = pct > 0.5 ? '#00ef88' : pct > 0.25 ? '#ffcc00' : '#ff2200';
-    ctx.shadowBlur  = GAME.perfMode ? 4 : 10;
-    ctx.shadowColor = hpCol;
-    ctx.fillStyle   = hpCol;
-
-    // Low HP heartbeat zoom effect via bar height pulse
-    const hpBh = pct <= CFG.LOW_HP_THRESHOLD / CFG.START_HP
-      ? bh + Math.sin(GAME.frame * 0.22) * 3
-      : bh;
-
-    ctx.fillRect(bx, by, bw * pct, hpBh);
-
-    ctx.shadowBlur  = GAME.perfMode ? 3 : 6;
-    ctx.shadowColor = p.color;
-    ctx.strokeStyle = p.color;
-    ctx.lineWidth   = 2;
-    ctx.strokeRect(bx, by, bw, bh);
-
-    ctx.shadowBlur  = 0;
-    ctx.font        = 'bold 11px "Courier New",monospace';
-    ctx.fillStyle   = '#ffffff';
-    ctx.textAlign   = 'center';
-    ctx.fillText(`${Math.ceil(p.hp)} / ${p.maxHp}`, bx + bw / 2, by + bh - 5);
-
-    ctx.font        = 'bold 13px "Courier New",monospace';
-    ctx.fillStyle   = p.color;
-    ctx.shadowBlur  = GAME.perfMode ? 4 : 8;
-    ctx.shadowColor = p.color;
-    ctx.textAlign   = isL ? 'left' : 'right';
-    ctx.fillText(`PLAYER ${pid}`, isL ? bx : bx + bw, by + bh + 18);
-
-    const icons = { FIST:'⚔', PALM:'🛡', POINT:'↗', NONE:'' };
-    ctx.font        = '17px Arial';
-    ctx.shadowBlur  = 0;
-    ctx.textAlign   = isL ? 'right' : 'left';
-    ctx.fillStyle   = '#ffffff';
-    ctx.fillText(icons[p.gesture] || '', isL ? bx + bw - 4 : bx + 4, by + bh - 3);
-
-    // LOW HEALTH text warning
-    if(pct <= CFG.LOW_HP_THRESHOLD / CFG.START_HP){
-      const pulseAlpha = 0.6 + Math.sin(GAME.frame * 0.28) * 0.4;
-      ctx.globalAlpha = pulseAlpha;
-      ctx.font        = 'bold 10px "Courier New",monospace';
-      ctx.fillStyle   = '#ff2200';
-      ctx.shadowBlur  = 10;
-      ctx.shadowColor = '#ff2200';
-      ctx.textAlign   = isL ? 'left' : 'right';
-      ctx.fillText('LOW HEALTH', isL ? bx : bx + bw, by - 8);
-    }
-
-    ctx.restore();
-  });
-
-  // Round display at very top-centre
-  drawRoundDisplay();
-
-  // VS badge
-  ctx.save();
-  ctx.font      = 'bold 13px "Courier New",monospace';
-  ctx.fillStyle = 'rgba(255,255,255,0.18)';
-  ctx.textAlign = 'center';
-  ctx.fillText('VS', W / 2, pad + 28 + bh - 5);
-  ctx.restore();
-}
-
-function drawRoundDisplay(){
-  const W = canvas.width;
-  ctx.save();
-
-  // Round label
-  ctx.font        = 'bold 14px "Courier New",monospace';
-  ctx.fillStyle   = 'rgba(255,255,255,0.8)';
-  ctx.textAlign   = 'center';
-  ctx.shadowBlur  = 8;
-  ctx.shadowColor = '#ffffff';
-  ctx.fillText(`ROUND ${GAME.roundNumber}`, W / 2, 18);
-
-  // Round score dots  ● ● ○
-  const dotR    = 6;
-  const dotGap  = 18;
-  const totalDots = CFG.ROUNDS_TO_WIN;
-
-  // P1 dots (left of centre)
-  for(let i = 0; i < totalDots; i++){
-    const won = i < GAME.player1RoundsWon;
-    const cx  = W / 2 - 60 - (totalDots - 1 - i) * dotGap;
-    ctx.beginPath();
-    ctx.arc(cx, 15, dotR, 0, Math.PI * 2);
-    ctx.fillStyle   = won ? P[1].color : 'rgba(255,255,255,0.15)';
-    ctx.shadowBlur  = won ? 10 : 0;
-    ctx.shadowColor = P[1].color;
-    ctx.fill();
-  }
-
-  // P2 dots (right of centre)
-  for(let i = 0; i < totalDots; i++){
-    const won = i < GAME.player2RoundsWon;
-    const cx  = W / 2 + 60 + i * dotGap;
-    ctx.beginPath();
-    ctx.arc(cx, 15, dotR, 0, Math.PI * 2);
-    ctx.fillStyle   = won ? P[2].color : 'rgba(255,255,255,0.15)';
-    ctx.shadowBlur  = won ? 10 : 0;
-    ctx.shadowColor = P[2].color;
-    ctx.fill();
-  }
-
-  ctx.restore();
-}
-
-function drawGestureHints(){
-  const icons = { FIST:'⚔ SWORD', PALM:'🛡 SHIELD', POINT:'↗ ARROW' };
-  [1, 2].forEach(pid => {
-    const p = P[pid];
-    if(!p.handPos || !icons[p.gesture]) return;
-    ctx.save();
-    ctx.font        = 'bold 14px Arial';
-    ctx.fillStyle   = P[pid].color;
-    ctx.shadowBlur  = GAME.perfMode ? 6 : 12;
-    ctx.shadowColor = P[pid].color;
-    ctx.textAlign   = 'center';
-    ctx.globalAlpha = 0.75;
-    ctx.fillText(icons[p.gesture], p.handPos.x, p.handPos.y - 65);
-    ctx.restore();
-  });
-}
-
-// ── Low HP vignette ───────────────────────────────────────────
-function drawLowHPVignette(){
-  if(GAME.state !== 'PLAYING') return;
-  [1,2].forEach(pid => {
-    const p   = P[pid];
-    const pct = p.hp / p.maxHp;
-    if(pct > CFG.LOW_HP_THRESHOLD / CFG.START_HP) return;
-
-    const pulse = 0.15 + Math.abs(Math.sin(GAME.frame * 0.12)) * 0.25;
-    const W = canvas.width, H = canvas.height;
-    const side = pid === 1 ? 'left' : 'right';
-
-    ctx.save();
-    const grad = ctx.createRadialGradient(
-      pid === 1 ? 0 : W, H / 2, 0,
-      pid === 1 ? 0 : W, H / 2, W * 0.8
-    );
-    grad.addColorStop(0,   `rgba(180,0,0,${pulse})`);
-    grad.addColorStop(0.4, `rgba(120,0,0,${pulse * 0.5})`);
-    grad.addColorStop(1,   'rgba(0,0,0,0)');
-
-    ctx.fillStyle = grad;
-    ctx.fillRect(0, 0, W, H);
-    ctx.restore();
-  });
-}
-
-// ── Countdown overlay ─────────────────────────────────────────
-function drawCountdown(){
-  if(GAME.state !== 'COUNTDOWN') return;
-  const W  = canvas.width;
-  const cy = canvas.height / 2;
-
-  ctx.save();
-  ctx.fillStyle = 'rgba(0,0,0,0.35)';
-  ctx.fillRect(0, 0, W, canvas.height);
-
-  const label = GAME.fightDisplayFrames > 0
-    ? 'FIGHT!'
-    : String(GAME.countdownValue);
-
-  const isFight = label === 'FIGHT!';
-  const fs = Math.max(72, Math.round(W * 0.13));
-
-  // Pop scale pulse
-  const pulse = isFight
-    ? 1 + Math.sin(GAME.fightDisplayFrames * 0.25) * 0.06
-    : 1 + Math.sin((75 - GAME.countdownTimer) * 0.12) * 0.04;
-
-  ctx.translate(W / 2, cy);
-  ctx.scale(pulse, pulse);
-
-  ctx.textAlign   = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.font        = `bold ${fs}px "Courier New",monospace`;
-  ctx.shadowBlur  = isFight ? 80 : 50;
-  ctx.shadowColor = isFight ? '#ffffff' : '#ffcc00';
-  ctx.fillStyle   = isFight ? '#ffffff' : '#ffcc00';
-  ctx.fillText(label, 0, 0);
-
-  // Halo ring
-  ctx.globalAlpha = 0.2;
-  ctx.strokeStyle = isFight ? '#ffffff' : '#ffcc00';
-  ctx.lineWidth   = 8;
-  ctx.shadowBlur  = 30;
-  ctx.beginPath();
-  ctx.arc(0, 0, fs * 0.7 * pulse, 0, Math.PI * 2);
-  ctx.stroke();
-
-  ctx.restore();
-}
-
-// ── Round End overlay ─────────────────────────────────────────
-function drawRoundEnd(){
-  if(GAME.state !== 'ROUND_END') return;
-  const w   = GAME.roundWinner;
-  const col = P[w].color;
-  const W   = canvas.width;
-
-  // How far into the pause are we?
-  const elapsed = GAME.frame - GAME.roundEndFrame;
-  const alpha   = Math.min(1, elapsed / 20);   // fade in quickly
-
-  ctx.save();
-  ctx.globalAlpha = alpha;
-  ctx.fillStyle   = 'rgba(0,0,0,0.7)';
-  ctx.fillRect(0, 0, W, canvas.height);
-
-  const fs = Math.max(28, Math.round(W * 0.065));
-  ctx.font        = `bold ${fs}px "Courier New",monospace`;
-  ctx.textAlign   = 'center';
-  ctx.shadowBlur  = 60;
-  ctx.shadowColor = col;
-  ctx.fillStyle   = col;
-  ctx.fillText(`PLAYER ${w}`, W / 2, canvas.height / 2 - fs * 0.6);
-
-  ctx.shadowBlur  = 30;
-  ctx.fillStyle   = '#ffffff';
-  ctx.fillText(`WINS ROUND ${GAME.roundNumber}`, W / 2, canvas.height / 2 + fs * 0.6);
-
-  // K.O. text
-  ctx.font        = `bold ${Math.round(fs * 0.5)}px "Courier New",monospace`;
-  ctx.shadowBlur  = 20;
-  ctx.shadowColor = '#ff2200';
-  ctx.fillStyle   = '#ff4400';
-  ctx.fillText('K.O.', W / 2, canvas.height / 2 + fs * 1.6);
-
-  ctx.restore();
-
-  // Auto-advance after delay
-  if(elapsed > CFG.ROUND_RESET_DELAY){
-    nextRoundOrEnd();
-  }
-}
-
-// ── Waiting screen ────────────────────────────────────────────
-function drawWaiting(){
-  if(GAME.state !== 'WAITING') return;
-  const hasP1 = !!P[1].handPos;
-  const hasP2 = !!P[2].handPos;
-  if(hasP1 && hasP2){
-    // Both hands detected — start first round countdown
-    startCountdown();
-    return;
-  }
-
-  const W  = canvas.width;
-  const cy = canvas.height / 2;
-
-  ctx.save();
-  ctx.fillStyle = 'rgba(0,0,0,0.6)';
-  ctx.fillRect(0, 0, W, canvas.height);
-
-  const fs = Math.max(24, Math.round(W * 0.052));
-  ctx.font        = `bold ${fs}px "Courier New",monospace`;
-  ctx.textAlign   = 'center';
-  ctx.shadowBlur  = 45;
-  ctx.shadowColor = '#3388ff';
-  ctx.fillStyle   = '#ffffff';
-  ctx.fillText('⚔  HAND COMBAT  ⚔', W / 2, cy - 90);
-
-  ctx.shadowBlur  = 0;
-  ctx.font        = `${Math.max(13, Math.round(W * 0.017))}px Arial`;
-  ctx.fillStyle   = 'rgba(180,210,255,0.75)';
-  ctx.fillText('Both players stand in front of the webcam', W / 2, cy - 42);
-  ctx.fillText('Player 1 → LEFT half    |    Player 2 → RIGHT half', W / 2, cy - 14);
-
-  const guide = [
-    ['✊  Fist',          '→  Summon Glowing Sword'],
-    ['🖐  Open Palm',     '→  Raise Energy Shield'],
-    ['☝  Point Finger',  '→  Shoot Energy Arrow'],
-    ['👏  Clap (2 hands)','→  Release Shockwave'],
-    ['🖐🖐  Both Palms', '→  Fire Power Blast Beam'],
-  ];
-  const gfs = Math.max(11, Math.round(W * 0.013));
-  ctx.font      = `${gfs}px Arial`;
-  ctx.fillStyle = 'rgba(160,200,255,0.55)';
-  guide.forEach(([g, a], i) => {
-    ctx.fillText(`${g}  ${a}`, W / 2, cy + 28 + i * 23);
-  });
-
-  [1, 2].forEach(pid => {
-    const has = pid === 1 ? hasP1 : hasP2;
-    const px  = pid === 1 ? W * 0.22 : W * 0.78;
-    ctx.font        = 'bold 16px Arial';
-    ctx.shadowBlur  = has ? 14 : 0;
-    ctx.shadowColor = '#00ff88';
-    ctx.fillStyle   = has ? '#00ff88' : '#ff4455';
-    ctx.fillText(`P${pid}: ${has ? '✓  READY' : '…waiting'}`, px, canvas.height * 0.86);
-  });
-
-  ctx.restore();
-}
-
-// ── Game Over screen ──────────────────────────────────────────
-function drawGameOver(){
-  if(GAME.state !== 'GAMEOVER') return;
-  const w   = GAME.winner;
-  const col = P[w].color;
-  const W   = canvas.width;
-
-  ctx.save();
-  ctx.fillStyle = 'rgba(0,0,0,0.82)';
-  ctx.fillRect(0, 0, W, canvas.height);
-
-  const fs = Math.max(28, Math.round(W * 0.07));
-  ctx.font        = `bold ${fs}px "Courier New",monospace`;
-  ctx.textAlign   = 'center';
-  ctx.shadowBlur  = 60;
-  ctx.shadowColor = col;
-  ctx.fillStyle   = col;
-
-  // "WINNER" label above
-  ctx.font      = `bold ${Math.round(fs * 0.4)}px "Courier New",monospace`;
-  ctx.fillStyle = 'rgba(255,255,255,0.7)';
-  ctx.shadowBlur = 20;
-  ctx.shadowColor = '#ffffff';
-  ctx.fillText('WINNER', W / 2, canvas.height / 2 - fs * 1.4);
-
-  ctx.font        = `bold ${fs}px "Courier New",monospace`;
-  ctx.shadowBlur  = 60;
-  ctx.shadowColor = col;
-  ctx.fillStyle   = col;
-  ctx.fillText(`PLAYER ${w} WINS!`, W / 2, canvas.height / 2 - 24);
-
-  // Round score recap
-  const scoreFs = Math.max(14, Math.round(W * 0.02));
-  ctx.font      = `${scoreFs}px "Courier New",monospace`;
-  ctx.fillStyle = 'rgba(255,255,255,0.5)';
-  ctx.shadowBlur = 0;
-  ctx.fillText(
-    `P1: ${GAME.player1RoundsWon}  —  P2: ${GAME.player2RoundsWon}`,
-    W / 2, canvas.height / 2 + 32
-  );
-
-  ctx.shadowBlur  = 15;
-  ctx.font        = `${Math.max(14, Math.round(W * 0.021))}px Arial`;
-  ctx.fillStyle   = 'rgba(255,255,255,0.65)';
-  ctx.fillText('Make a FIST to play again', W / 2, canvas.height / 2 + 70);
-
-  ctx.restore();
-
-  // FIX: only winning player can restart (prevents accidental restart)
-  if(P[w].gesture === 'FIST') resetMatch();
-}
-
-// ── Screen FX (shake + flash + low HP effects) ────────────────
-function applyScreenFX(){
-  // Screen shake
-  if(GAME.shake > 0.5){
-    ctx.translate(
-      (Math.random() - 0.5) * GAME.shake,
-      (Math.random() - 0.5) * GAME.shake
-    );
-    GAME.shake *= 0.78;
-  } else { GAME.shake = 0; }
-
-  // Hit flash overlay
-  if(GAME.flash.alpha > 0.01){
-    ctx.save();
-    ctx.globalAlpha = GAME.flash.alpha;
-    ctx.fillStyle   = GAME.flash.color;
-    ctx.fillRect(-20, -20, canvas.width + 40, canvas.height + 40);
-    ctx.restore();
-    GAME.flash.alpha *= 0.82;
-  }
-}
-
-// ════════════════════════════════════════════════════════════════
-//  SECTION 12 · COUNTDOWN LOGIC (called in game loop)
-// ════════════════════════════════════════════════════════════════
-function updateCountdown(){
-  if(GAME.state !== 'COUNTDOWN') return;
-
-  // If FIGHT! is currently showing, count down its display frames
-  if(GAME.fightDisplayFrames > 0){
-    GAME.fightDisplayFrames--;
-    if(GAME.fightDisplayFrames === 0){
-      // Countdown fully complete — enter PLAYING
-      GAME.state         = 'PLAYING';
-      GAME.damageEnabled = true;
-    }
-    return;
-  }
-
-  GAME.countdownTimer--;
-  if(GAME.countdownTimer <= 0){
-    GAME.countdownValue--;
-    if(GAME.countdownValue <= 0){
-      // Switch to FIGHT! display
-      GAME.fightDisplayFrames = 60;  // show FIGHT for ~1 sec
-    } else {
-      GAME.countdownTimer = 75;  // next digit in ~1.25s
-    }
-  }
-}
-
-// ════════════════════════════════════════════════════════════════
-//  SECTION 13 · MAIN GAME LOOP
-// ════════════════════════════════════════════════════════════════
-function loop(){
-  requestAnimationFrame(loop);
-  GAME.frame++;
-  updateFPS();
-
-  ctx.save();
-
-  drawBackground();
-  applyScreenFX();
-
-  // Hand skeletons always visible for player feedback
-  drawSkeleton(P[1].lm,  P[1].color, 0.7);
-  drawSkeleton(P[1].lm2, P[1].color, 0.35);
-  drawSkeleton(P[2].lm,  P[2].color, 0.7);
-  drawSkeleton(P[2].lm2, P[2].color, 0.35);
-
-  // ── Active gameplay states ─────────────────────────────────
-  if(GAME.state === 'PLAYING' || GAME.state === 'COUNTDOWN'){
-    // Update weapons (but no damage during countdown)
-    [1, 2].forEach(pid => {
-      const p = P[pid];
-      if(p.weapon){
-        p.weapon.update();
-        p.weapon.draw();
-        // FIX: weapon cleanup when gesture changes
-        if(p.weapon.type === 'SWORD'  && p.gesture !== 'FIST') p.weapon = null;
-        if(p.weapon.type === 'SHIELD' && p.gesture !== 'PALM') p.weapon = null;
-      }
-    });
-
-    // Projectiles & effects (still render during countdown, just don't do damage)
-    projectiles = projectiles.filter(a => a.alive);
-    projectiles.forEach(a => { a.update(); a.draw(); });
-
-    effects = effects.filter(e => e.alive);
-    effects.forEach(e => { e.update(); e.draw(); });
-
-    drawGestureHints();
-    drawLowHPVignette();
-    drawHUD();
-  }
-
-  // Draw round-end weapons/effects (already cleared in endRound, but draw remaining)
-  if(GAME.state === 'ROUND_END'){
-    drawHUD();
-  }
-
-  // ── Overlay screens ────────────────────────────────────────
-  drawWaiting();
-  updateCountdown();
-  drawCountdown();
-  drawRoundEnd();
-  drawGameOver();
-
-  ctx.restore();
-}
-
-loop();
-
-// ════════════════════════════════════════════════════════════════
-//  SECTION 14 · CAMERA / MEDIAPIPE INIT
+//  §9  CAMERA
 // ════════════════════════════════════════════════════════════════
 const camera = new Camera(video, {
   onFrame: async () => { await hands.send({ image: video }); },
   width: 1280, height: 720,
 });
-
-camera.start().then(() => {
-  loadEl.style.display = 'none';
-}).catch(err => {
-  loadEl.innerHTML = `<span style="color:#f55">Webcam error: ${err.message}</span>
+camera.start().then(()=>{
+  loadEl.style.display='none';
+}).catch(err=>{
+  loadEl.innerHTML=`<span style="color:#f55">Webcam error: ${err.message}</span>
     <p>Please allow camera access and reload the page.</p>`;
 });
+
+// ════════════════════════════════════════════════════════════════
+//  §10  RENDERING
+// ════════════════════════════════════════════════════════════════
+function drawBackground(){
+  const W=canvas.width, H=canvas.height;
+  const g=ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'#090918'); g.addColorStop(1,'#030310');
+  ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+
+  ctx.save(); ctx.globalAlpha=0.13;
+  if(video.readyState>=2) ctx.drawImage(video,0,0,W,H);
+  ctx.restore();
+
+  ctx.save();
+  const zg1=ctx.createLinearGradient(0,0,W*0.42,0);
+  zg1.addColorStop(0,P[1].color+'1a'); zg1.addColorStop(1,'transparent');
+  ctx.fillStyle=zg1; ctx.fillRect(0,0,W/2,H);
+  const zg2=ctx.createLinearGradient(W,0,W*0.58,0);
+  zg2.addColorStop(0,P[2].color+'1a'); zg2.addColorStop(1,'transparent');
+  ctx.fillStyle=zg2; ctx.fillRect(W/2,0,W/2,H);
+  ctx.restore();
+
+  ctx.save(); ctx.strokeStyle='rgba(255,255,255,0.07)'; ctx.lineWidth=2;
+  ctx.setLineDash([28,14]);
+  ctx.beginPath(); ctx.moveTo(W/2,0); ctx.lineTo(W/2,H); ctx.stroke();
+  ctx.setLineDash([]); ctx.restore();
+
+  ctx.save();
+  const fl=ctx.createLinearGradient(0,0,W,0);
+  fl.addColorStop(0,P[1].color+'cc'); fl.addColorStop(0.5,'rgba(200,200,255,0.4)'); fl.addColorStop(1,P[2].color+'cc');
+  ctx.strokeStyle=fl; ctx.lineWidth=2; ctx.shadowBlur=18; ctx.shadowColor='#6688ff';
+  ctx.beginPath(); ctx.moveTo(0,H-2); ctx.lineTo(W,H-2); ctx.stroke();
+  ctx.restore();
+}
+
+function drawSkeleton(lm,color,alpha){
+  if(!lm) return;
+  const CONN=[
+    [0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],
+    [0,9],[9,10],[10,11],[11,12],[0,13],[13,14],[14,15],[15,16],
+    [0,17],[17,18],[18,19],[19,20],[5,9],[9,13],[13,17],
+  ];
+  ctx.save(); ctx.globalAlpha=alpha; ctx.strokeStyle=color;
+  ctx.lineWidth=1.5; ctx.shadowBlur=6; ctx.shadowColor=color;
+  CONN.forEach(([a,b])=>{
+    ctx.beginPath();
+    ctx.moveTo(lm[a].x*canvas.width,lm[a].y*canvas.height);
+    ctx.lineTo(lm[b].x*canvas.width,lm[b].y*canvas.height);
+    ctx.stroke();
+  });
+  ctx.fillStyle=color;
+  lm.forEach(pt=>{
+    ctx.beginPath(); ctx.arc(pt.x*canvas.width,pt.y*canvas.height,2.5,0,Math.PI*2); ctx.fill();
+  });
+  ctx.restore();
+}
+
+function drawHUD(){
+  const W=canvas.width, bw=Math.min(W*0.33,380), bh=22, pad=16;
+  [1,2].forEach(pid=>{
+    const p=P[pid], isL=pid===1;
+    const bx=isL?pad:W-pad-bw, by=pad, pct=p.hp/p.maxHp;
+    ctx.save();
+    ctx.fillStyle='rgba(0,0,0,0.55)'; ctx.fillRect(bx-6,by-6,bw+12,bh+38);
+    const hpCol=pct>0.5?'#00ef88':pct>0.25?'#ffcc00':'#ff2200';
+    ctx.shadowBlur=10; ctx.shadowColor=hpCol; ctx.fillStyle=hpCol;
+    ctx.fillRect(bx,by,bw*pct,bh);
+    ctx.shadowBlur=6; ctx.shadowColor=p.color; ctx.strokeStyle=p.color; ctx.lineWidth=2;
+    ctx.strokeRect(bx,by,bw,bh);
+    ctx.shadowBlur=0; ctx.font='bold 11px "Courier New",monospace';
+    ctx.fillStyle='#ffffff'; ctx.textAlign='center';
+    ctx.fillText(`${Math.ceil(p.hp)} / ${p.maxHp}`, bx+bw/2, by+bh-5);
+    ctx.font='bold 13px "Courier New",monospace'; ctx.fillStyle=p.color;
+    ctx.shadowBlur=8; ctx.shadowColor=p.color;
+    ctx.textAlign=isL?'left':'right';
+    ctx.fillText(`PLAYER ${pid}`, isL?bx:bx+bw, by+bh+18);
+    const icons={FIST:'⚔',PALM:'🛡',POINT:'↗',NONE:''};
+    ctx.font='17px Arial'; ctx.shadowBlur=0;
+    ctx.textAlign=isL?'right':'left'; ctx.fillStyle='#ffffff';
+    ctx.fillText(icons[p.gesture]||'', isL?bx+bw-4:bx+4, by+bh-3);
+    ctx.restore();
+  });
+  ctx.save(); ctx.font='bold 13px "Courier New",monospace';
+  ctx.fillStyle='rgba(255,255,255,0.18)'; ctx.textAlign='center';
+  ctx.fillText('VS', W/2, pad+bh-5); ctx.restore();
+}
+
+function drawGestureHints(){
+  const icons={FIST:'⚔ SWORD',PALM:'🛡 SHIELD',POINT:'↗ ARROW'};
+  [1,2].forEach(pid=>{
+    const p=P[pid]; if(!p.handPos||!icons[p.gesture]) return;
+    ctx.save(); ctx.font='bold 14px Arial'; ctx.fillStyle=P[pid].color;
+    ctx.shadowBlur=12; ctx.shadowColor=P[pid].color;
+    ctx.textAlign='center'; ctx.globalAlpha=0.75;
+    ctx.fillText(icons[p.gesture],p.handPos.x,p.handPos.y-65);
+    ctx.restore();
+  });
+}
+
+// ── Countdown overlay ──────────────────────────────────────────
+function drawCountdown(){
+  if(GAME.state!=='COUNTDOWN') return;
+  const W=canvas.width, cy=canvas.height/2;
+
+  // Dim overlay
+  ctx.save();
+  ctx.fillStyle='rgba(0,0,0,0.32)'; ctx.fillRect(0,0,W,canvas.height);
+
+  const label = CD.fightFrames > 0 ? 'FIGHT!' : String(CD.value);
+  const isFight = label==='FIGHT!';
+  const fs = Math.max(72, Math.round(W*0.14));
+  // Pop pulse
+  const elapsed = isFight ? (58 - CD.fightFrames) : (78 - CD.timer);
+  const pulse = 1 + Math.sin(elapsed * 0.18) * 0.05;
+
+  ctx.translate(W/2, cy);
+  ctx.scale(pulse, pulse);
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.font=`bold ${fs}px "Courier New",monospace`;
+  ctx.shadowBlur  = isFight ? 80 : 55;
+  ctx.shadowColor = isFight ? '#ffffff' : '#ffcc00';
+  ctx.fillStyle   = isFight ? '#ffffff' : '#ffcc00';
+  ctx.fillText(label, 0, 0);
+
+  // Halo ring
+  ctx.globalAlpha=0.18; ctx.strokeStyle=isFight?'#ffffff':'#ffcc00';
+  ctx.lineWidth=8; ctx.shadowBlur=28;
+  ctx.beginPath(); ctx.arc(0,0,fs*0.72,0,Math.PI*2); ctx.stroke();
+  ctx.restore();
+}
+
+// ── Waiting screen ─────────────────────────────────────────────
+function drawWaiting(){
+  if(GAME.state!=='WAITING') return;
+  const hasP1=!!P[1].handPos, hasP2=!!P[2].handPos;
+  if(hasP1&&hasP2){
+    startCountdown();
+    SND.roundStart();
+    return;
+  }
+  const W=canvas.width, cy=canvas.height/2;
+  ctx.save();
+  ctx.fillStyle='rgba(0,0,0,0.6)'; ctx.fillRect(0,0,W,canvas.height);
+  const fs=Math.max(24,Math.round(W*0.052));
+  ctx.font=`bold ${fs}px "Courier New",monospace`; ctx.textAlign='center';
+  ctx.shadowBlur=45; ctx.shadowColor='#3388ff'; ctx.fillStyle='#ffffff';
+  ctx.fillText('⚔  HAND COMBAT  ⚔', W/2, cy-90);
+  ctx.shadowBlur=0;
+  ctx.font=`${Math.max(13,Math.round(W*0.017))}px Arial`;
+  ctx.fillStyle='rgba(180,210,255,0.75)';
+  ctx.fillText('Both players stand in front of the webcam', W/2, cy-42);
+  ctx.fillText('Player 1 → LEFT half    |    Player 2 → RIGHT half', W/2, cy-14);
+  ctx.font=`${Math.max(11,Math.round(W*0.013))}px "Courier New",monospace`;
+  ctx.fillStyle='rgba(100,200,255,0.5)';
+  ctx.fillText('[M] Toggle Music   [N] Toggle SFX   Click anywhere to enable audio', W/2, cy+8);
+  const guide=[
+    ['✊  Fist','→  Summon Glowing Sword'],
+    ['🖐  Open Palm','→  Raise Energy Shield'],
+    ['☝  Point Finger','→  Shoot Energy Arrow'],
+    ['👏  Clap (2 hands)','→  Release Shockwave'],
+    ['🖐🖐  Both Palms','→  Fire Power Blast Beam'],
+  ];
+  const gfs=Math.max(11,Math.round(W*0.013));
+  ctx.font=`${gfs}px Arial`; ctx.fillStyle='rgba(160,200,255,0.55)';
+  guide.forEach(([g,a],i)=>{
+    ctx.fillText(`${g}  ${a}`, W/2, cy+32+i*23);
+  });
+  [1,2].forEach(pid=>{
+    const has=pid===1?hasP1:hasP2, px=pid===1?W*0.22:W*0.78;
+    ctx.font='bold 16px Arial'; ctx.shadowBlur=has?14:0;
+    ctx.shadowColor='#00ff88'; ctx.fillStyle=has?'#00ff88':'#ff4455';
+    ctx.fillText(`P${pid}: ${has?'✓  READY':'…waiting'}`, px, canvas.height*0.86);
+  });
+  ctx.restore();
+}
+
+// ── Game Over screen ───────────────────────────────────────────
+function drawGameOver(){
+  if(GAME.state!=='GAMEOVER') return;
+  const w=GAME.winner, col=P[w].color;
+  ctx.save();
+  ctx.fillStyle='rgba(0,0,0,0.8)'; ctx.fillRect(0,0,canvas.width,canvas.height);
+  const fs=Math.max(28,Math.round(canvas.width*0.07));
+  ctx.font=`bold ${fs}px "Courier New",monospace`; ctx.textAlign='center';
+  ctx.shadowBlur=60; ctx.shadowColor=col; ctx.fillStyle=col;
+  ctx.fillText(`PLAYER ${w} WINS!`, canvas.width/2, canvas.height/2-24);
+  ctx.shadowBlur=15; ctx.font=`${Math.max(14,Math.round(canvas.width*0.021))}px Arial`;
+  ctx.fillStyle='rgba(255,255,255,0.65)';
+  ctx.fillText('Make a FIST to play again', canvas.width/2, canvas.height/2+50);
+  ctx.restore();
+  if(P[w].gesture==='FIST') resetGame();
+}
+
+// ── Screen shake + flash ───────────────────────────────────────
+function applyScreenFX(){
+  if(GAME.shake>0.5){
+    ctx.translate((Math.random()-0.5)*GAME.shake,(Math.random()-0.5)*GAME.shake);
+    GAME.shake*=0.78;
+  } else { GAME.shake=0; }
+  if(GAME.flash.alpha>0.01){
+    ctx.save(); ctx.globalAlpha=GAME.flash.alpha;
+    ctx.fillStyle=GAME.flash.color;
+    ctx.fillRect(-20,-20,canvas.width+40,canvas.height+40);
+    ctx.restore(); GAME.flash.alpha*=0.82;
+  }
+}
+
+// ════════════════════════════════════════════════════════════════
+//  §11  MAIN GAME LOOP
+// ════════════════════════════════════════════════════════════════
+function loop(){
+  requestAnimationFrame(loop);
+  GAME.frame++;
+
+  ctx.save();
+  drawBackground();
+  applyScreenFX();
+
+  drawSkeleton(P[1].lm,  P[1].color, 0.7);
+  drawSkeleton(P[1].lm2, P[1].color, 0.35);
+  drawSkeleton(P[2].lm,  P[2].color, 0.7);
+  drawSkeleton(P[2].lm2, P[2].color, 0.35);
+
+  if(GAME.state==='PLAYING'){
+    [1,2].forEach(pid=>{
+      const p=P[pid];
+      if(p.weapon){
+        p.weapon.update(); p.weapon.draw();
+        if(p.weapon.type==='SWORD' && p.gesture!=='FIST') p.weapon=null;
+        if(p.weapon.type==='SHIELD'&& p.gesture!=='PALM') p.weapon=null;
+      }
+    });
+    projectiles=projectiles.filter(a=>a.alive);
+    projectiles.forEach(a=>{a.update();a.draw();});
+    effects=effects.filter(e=>e.alive);
+    effects.forEach(e=>{e.update();e.draw();});
+    drawGestureHints(); drawHUD();
+  }
+
+  // Countdown runs in parallel with skeleton display
+  if(GAME.state==='COUNTDOWN'){
+    updateCountdown();
+    drawCountdown();
+    drawHUD();  // show health bars during countdown too
+  }
+
+  drawWaiting();
+  drawGameOver();
+  ctx.restore();
+}
+
+loop();
 </script>
 </body>
 </html>
