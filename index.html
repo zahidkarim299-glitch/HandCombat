@@ -5,10 +5,13 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>⚔ HAND COMBAT</title>
 <style>
+  /* ── Base ────────────────────────────────────────────────────── */
   *{margin:0;padding:0;box-sizing:border-box}
   body{background:#000;overflow:hidden;width:100vw;height:100vh}
   #videoEl{display:none;position:absolute}
   #gameCanvas{display:block;width:100vw;height:100vh}
+
+  /* ── Loading screen ─────────────────────────────────────────── */
   #loadMsg{
     position:fixed;inset:0;display:flex;align-items:center;
     justify-content:center;flex-direction:column;gap:16px;
@@ -25,7 +28,7 @@
 </head>
 <body>
 
-<!-- Hidden video feed for MediaPipe -->
+<!-- Hidden video feed for MediaPipe — must NOT be mirrored here, raw coords needed -->
 <video id="videoEl" playsinline autoplay muted></video>
 <!-- All game graphics drawn here -->
 <canvas id="gameCanvas"></canvas>
@@ -45,18 +48,20 @@
 
 <script>
 'use strict';
-// ═══════════════════════════════════════════════════════════════
-//  ⚔  HAND COMBAT  ⚔
-//  Two-player browser fighting game using MediaPipe Hand Tracking
-//  Player 1 = LEFT side of webcam   |   Player 2 = RIGHT side
-// ═══════════════════════════════════════════════════════════════
+// ╔═══════════════════════════════════════════════════════════════╗
+// ║  ⚔  HAND COMBAT  v2.0  ⚔                                    ║
+// ║  Two-player browser fighting game — MediaPipe Hand Tracking  ║
+// ║  Player 1 = LEFT side of webcam  |  Player 2 = RIGHT side   ║
+// ╚═══════════════════════════════════════════════════════════════╝
 
+// ════════════════════════════════════════════════════════════════
+//  SECTION 1 · DOM REFS & CANVAS SIZING
+// ════════════════════════════════════════════════════════════════
 const video  = document.getElementById('videoEl');
 const canvas = document.getElementById('gameCanvas');
 const ctx    = canvas.getContext('2d');
 const loadEl = document.getElementById('loadMsg');
 
-// ── Canvas sizing ──────────────────────────────────────────────
 function resize(){
   canvas.width  = window.innerWidth;
   canvas.height = window.innerHeight;
@@ -64,10 +69,11 @@ function resize(){
 resize();
 window.addEventListener('resize', resize);
 
-// ═══════════════════════════════════════════════════════════════
-// CONFIG  — tweak damage / cooldowns here
-// ═══════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
+//  SECTION 2 · CONFIG
+// ════════════════════════════════════════════════════════════════
 const CFG = {
+  // Combat
   SWORD_DAMAGE    : 14,
   SWORD_CD        : 1200,   // ms between sword hits
   SWORD_RANGE     : 75,     // px proximity to trigger hit
@@ -78,38 +84,82 @@ const CFG = {
   SHOCK_CD        : 2000,
   BEAM_DAMAGE     : 35,
   BEAM_CD         : 3500,
-  BEAM_FRAMES     : 80,     // duration of power beam
+  BEAM_FRAMES     : 80,     // duration of power beam in frames
   SHIELD_RADIUS   : 68,
-  CLAP_DIST       : 190,    // px — max dist between wrists to count as clap
+  CLAP_DIST       : 190,    // px — max dist between wrists to clap
   START_HP        : 100,
+
+  // Round system
+  ROUNDS_TO_WIN   : 2,      // best of 3
+  ROUND_RESET_DELAY: 180,   // frames pause between rounds
+
+  // Countdown
+  COUNTDOWN_START : 3,      // 3 → 2 → 1 → FIGHT
+
+  // Low health threshold
+  LOW_HP_THRESHOLD: 25,
+
+  // Performance
+  PERF_FPS_TARGET : 50,     // below this, enable performance mode
+  TRAIL_MAX       : 12,     // max trail samples (reduced in perf mode)
 };
 
-// ═══════════════════════════════════════════════════════════════
-// GAME STATE
-// ═══════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
+//  SECTION 3 · GAME STATE
+// ════════════════════════════════════════════════════════════════
 const GAME = {
-  state   : 'WAITING',   // 'WAITING' | 'PLAYING' | 'GAMEOVER'
-  winner  : null,
-  shake   : 0,
-  flash   : { alpha: 0, color: '#fff' },
-  frame   : 0,
+  // Core state
+  state       : 'WAITING',  // 'WAITING' | 'COUNTDOWN' | 'PLAYING' | 'ROUND_END' | 'GAMEOVER'
+  winner      : null,       // pid of match winner
+
+  // Round tracking
+  roundNumber       : 1,
+  player1RoundsWon  : 0,
+  player2RoundsWon  : 0,
+  roundWinner       : null, // pid of round winner (null until round ends)
+  roundEndFrame     : 0,    // frame timestamp when round ended
+
+  // Countdown
+  countdownValue    : CFG.COUNTDOWN_START, // 3,2,1 then 'FIGHT'
+  countdownTimer    : 0,    // frames until next countdown step
+  fightDisplayFrames: 0,    // frames left to show "FIGHT!"
+
+  // Screen effects
+  shake       : 0,
+  flash       : { alpha: 0, color: '#fff' },
+
+  // Performance
+  frame       : 0,
+  lastFrameTime: performance.now(),
+  fps         : 60,
+  perfMode    : false,      // auto-enabled when fps drops
+  frameTimings: [],         // rolling buffer for FPS calc
+
+  // Damage gate — false during countdown
+  damageEnabled: false,
 };
 
+// ════════════════════════════════════════════════════════════════
+//  SECTION 4 · PLAYER SYSTEM
+// ════════════════════════════════════════════════════════════════
 function makePlayer(id, color){
   return {
     id, color,
-    hp        : CFG.START_HP,
-    maxHp     : CFG.START_HP,
-    gesture   : 'NONE',
-    handPos   : null,      // {x,y} canvas coords of primary wrist
-    lm        : null,      // primary hand landmarks (array[21])
-    lm2       : null,      // secondary hand landmarks
-    isShield  : false,
-    weapon    : null,      // active Sword or Shield instance
-    lastSword : 0,         // timestamp of last sword hit dealt
-    arrowCD   : 0,
-    shockCD   : 0,
-    beamCD    : 0,
+    hp          : CFG.START_HP,
+    maxHp       : CFG.START_HP,
+    gesture     : 'NONE',
+    // FIX: gestureBuffer adds stability — require N consistent frames before changing gesture
+    gestureBuffer     : [],
+    gestureLock       : 'NONE',   // the confirmed stable gesture
+    handPos     : null,   // {x,y} canvas coords of primary wrist (LOGICAL coords, not mirrored)
+    lm          : null,   // primary hand landmarks (array[21])
+    lm2         : null,   // secondary hand landmarks
+    isShield    : false,
+    weapon      : null,   // active Sword or Shield instance
+    lastSword   : 0,      // timestamp of last sword hit dealt
+    arrowCD     : 0,
+    shockCD     : 0,
+    beamCD      : 0,
   };
 }
 
@@ -121,46 +171,55 @@ const P = {
 let projectiles = [];   // active Arrow instances
 let effects     = [];   // Shockwave, PowerBeam, HitRing instances
 
-// ═══════════════════════════════════════════════════════════════
-// GESTURE DETECTION
-// ═══════════════════════════════════════════════════════════════
-// MediaPipe landmark indices (tip / pip pairs):
+// ════════════════════════════════════════════════════════════════
+//  SECTION 5 · GESTURE SYSTEM
+// ════════════════════════════════════════════════════════════════
+// MediaPipe landmark indices (tip / pip):
 //   index=8/6, middle=12/10, ring=16/14, pinky=20/18
-
-function up(lm, tip, pip){ return lm[tip].y < lm[pip].y; }
+function fingerUp(lm, tip, pip){ return lm[tip].y < lm[pip].y; }
 
 function detectGesture(lm){
   if(!lm) return 'NONE';
-  const i = up(lm, 8,  6);
-  const m = up(lm, 12, 10);
-  const r = up(lm, 16, 14);
-  const p = up(lm, 20, 18);
+  const i = fingerUp(lm,  8,  6);
+  const m = fingerUp(lm, 12, 10);
+  const r = fingerUp(lm, 16, 14);
+  const p = fingerUp(lm, 20, 18);
   const n = [i,m,r,p].filter(Boolean).length;
-  if(n === 0)                      return 'FIST';   // ⚔ Sword
-  if(n === 4)                      return 'PALM';   // 🛡 Shield
-  if(i && !m && !r && !p)          return 'POINT';  // 🏹 Arrow
+  if(n === 0)             return 'FIST';   // ⚔ Sword
+  if(n === 4)             return 'PALM';   // 🛡 Shield
+  if(i && !m && !r && !p) return 'POINT';  // 🏹 Arrow
   return 'NONE';
 }
 
-// ═══════════════════════════════════════════════════════════════
-// WEAPON CLASSES
-// ═══════════════════════════════════════════════════════════════
+// Stabilise gesture: require 3 consistent readings before committing
+const GESTURE_BUFFER_SIZE = 3;
+function stableGesture(pid, raw){
+  const p = P[pid];
+  p.gestureBuffer.push(raw);
+  if(p.gestureBuffer.length > GESTURE_BUFFER_SIZE) p.gestureBuffer.shift();
+  // Only confirm if all recent readings agree
+  const allSame = p.gestureBuffer.every(g => g === p.gestureBuffer[0]);
+  if(allSame) p.gestureLock = p.gestureBuffer[0];
+  return p.gestureLock;
+}
 
-// ── Sword ────────────────────────────────────────────────────
-// Sword angle is calculated from wrist (LM 0) → middle finger base (LM 9)
-// so the blade always points in the natural direction of the hand.
+// ════════════════════════════════════════════════════════════════
+//  SECTION 6 · WEAPONS
+// ════════════════════════════════════════════════════════════════
+
+// ── Sword ─────────────────────────────────────────────────────
 class Sword {
   constructor(pid){
     this.pid    = pid;
     this.type   = 'SWORD';
     this.age    = 0;
-    this.angle  = 0;       // radians — updated each frame from hand landmarks
-    this.wx     = 0;       // wrist canvas X
-    this.wy     = 0;       // wrist canvas Y
-    this.tx     = 0;       // blade tip X  (world coords, for hit detection)
-    this.ty     = 0;       // blade tip Y
-    this.trails = [];      // tip trail [{x,y,angle}] for motion blur
-    this.LENGTH = 148;     // blade length in pixels
+    this.angle  = 0;
+    this.wx     = 0;  // wrist canvas X  (logical, not display-mirrored)
+    this.wy     = 0;
+    this.tx     = 0;  // blade tip X
+    this.ty     = 0;
+    this.trails = [];
+    this.LENGTH = 148;
   }
 
   update(){
@@ -169,29 +228,29 @@ class Sword {
     const lm = p.lm;
     if(!lm) return;
 
-    // ── Angle from wrist (LM 0) → middle-finger base (LM 9) ──
-    const wrist  = lm[0];
+    // Angle from wrist (LM0) → middle finger base (LM9)
+    // NOTE: we use raw lm.x coords (0-1) as logical coords throughout.
+    //       The visual mirroring only happens when DRAWING the video frame.
+    const wrist   = lm[0];
     const midBase = lm[9];
     const dx = (midBase.x - wrist.x) * canvas.width;
     const dy = (midBase.y - wrist.y) * canvas.height;
-    this.angle = Math.atan2(dy, dx);   // pointing direction of the hand
+    this.angle = Math.atan2(dy, dx);
 
-    // Wrist position in canvas space
     this.wx = wrist.x * canvas.width;
     this.wy = wrist.y * canvas.height;
-
-    // Blade tip = wrist + LENGTH along the hand direction
     this.tx = this.wx + Math.cos(this.angle) * this.LENGTH;
     this.ty = this.wy + Math.sin(this.angle) * this.LENGTH;
 
-    // Store trail sample at blade tip (world coords)
+    const maxTrail = GAME.perfMode ? 6 : CFG.TRAIL_MAX;
     this.trails.push({ x: this.tx, y: this.ty, a: this.angle });
-    if(this.trails.length > 12) this.trails.shift();
+    if(this.trails.length > maxTrail) this.trails.shift();
 
-    // ── Hit detection at blade tip ────────────────────────────
+    // Hit detection — only when damage is enabled
+    if(!GAME.damageEnabled) return;
     const opp = P[this.pid === 1 ? 2 : 1];
     if(opp.handPos && !opp.isShield){
-      const d = Math.hypot(this.tx - opp.handPos.x, this.ty - opp.handPos.y);
+      const d   = Math.hypot(this.tx - opp.handPos.x, this.ty - opp.handPos.y);
       const now = performance.now();
       if(d < CFG.SWORD_RANGE && now - p.lastSword > CFG.SWORD_CD){
         p.lastSword = now;
@@ -204,17 +263,18 @@ class Sword {
   draw(){
     if(!P[this.pid].lm) return;
     const BLADE = this.LENGTH;
-    const GUARD = 30;   // cross-guard half-width
+    const GUARD = 30;
+    const shadowSize = GAME.perfMode ? 10 : 32;
 
-    // ── Motion trail — ghost blades along recent tip path ─────
+    // Motion trail
     for(let i = 0; i < this.trails.length; i++){
-      const t   = this.trails[i];
+      const t    = this.trails[i];
       const frac = (i + 1) / this.trails.length;
       ctx.save();
       ctx.globalAlpha = frac * 0.30;
       ctx.translate(this.wx, this.wy);
       ctx.rotate(t.a);
-      ctx.shadowBlur  = 4;
+      ctx.shadowBlur  = GAME.perfMode ? 0 : 4;
       ctx.shadowColor = '#ffaa00';
       ctx.strokeStyle = '#ffcc44';
       ctx.lineWidth   = 3 * frac;
@@ -226,13 +286,12 @@ class Sword {
       ctx.restore();
     }
 
-    // ── Main blade (drawn in local space, rotated to hand angle) ─
     ctx.save();
     ctx.translate(this.wx, this.wy);
     ctx.rotate(this.angle);
 
     // Wide outer glow
-    ctx.shadowBlur  = 32;
+    ctx.shadowBlur  = shadowSize;
     ctx.shadowColor = '#ffaa00';
     ctx.strokeStyle = '#ffdd44';
     ctx.lineWidth   = 8;
@@ -244,14 +303,14 @@ class Sword {
     ctx.stroke();
 
     // Bright white core
-    ctx.shadowBlur  = 10;
+    ctx.shadowBlur  = GAME.perfMode ? 4 : 10;
     ctx.shadowColor = '#ffffff';
     ctx.strokeStyle = '#ffffff';
     ctx.lineWidth   = 2.5;
     ctx.stroke();
 
-    // Tip sparkle — small diamond at blade tip
-    ctx.shadowBlur  = 20;
+    // Tip sparkle
+    ctx.shadowBlur  = GAME.perfMode ? 8 : 20;
     ctx.shadowColor = '#fffaaa';
     ctx.strokeStyle = '#fffaaa';
     ctx.lineWidth   = 1.5;
@@ -261,26 +320,24 @@ class Sword {
     ctx.lineTo(BLADE + 10,  0);
     ctx.lineTo(BLADE,       7);
     ctx.closePath();
-    ctx.fillStyle   = 'rgba(255,250,200,0.5)';
+    ctx.fillStyle = 'rgba(255,250,200,0.5)';
     ctx.fill();
     ctx.stroke();
 
-    // Cross-guard — perpendicular bar at 25 % along blade
+    // Cross-guard
     const gx = BLADE * 0.22;
-    ctx.shadowBlur  = 14;
+    ctx.shadowBlur  = GAME.perfMode ? 6 : 14;
     ctx.shadowColor = '#ffaa00';
     ctx.strokeStyle = '#ffcc44';
     ctx.lineWidth   = 5;
-    ctx.lineCap     = 'round';
     ctx.beginPath();
     ctx.moveTo(gx, -GUARD);
     ctx.lineTo(gx,  GUARD);
     ctx.stroke();
 
-    // Guard centre accent
     ctx.strokeStyle = '#ffffff';
     ctx.lineWidth   = 1.5;
-    ctx.shadowBlur  = 6;
+    ctx.shadowBlur  = 4;
     ctx.shadowColor = '#ffffff';
     ctx.beginPath();
     ctx.moveTo(gx, -GUARD * 0.5);
@@ -309,10 +366,10 @@ class Shield {
     const p = P[this.pid];
     if(!p.handPos) return;
     const { x, y } = p.handPos;
+    const shadowSize = GAME.perfMode ? 12 : 35;
     ctx.save();
 
-    // Main glow ring
-    ctx.shadowBlur  = 35;
+    ctx.shadowBlur  = shadowSize;
     ctx.shadowColor = p.color;
     ctx.strokeStyle = p.color;
     ctx.lineWidth   = 4;
@@ -321,42 +378,42 @@ class Shield {
     ctx.arc(x, y, this.r, 0, Math.PI * 2);
     ctx.stroke();
 
-    // Fill shimmer
     ctx.globalAlpha = 0.1;
     ctx.fillStyle   = p.color;
     ctx.fill();
 
-    // Hexagonal inner pattern (rotates slowly)
-    ctx.globalAlpha = 0.35;
-    ctx.strokeStyle = '#ffffff';
-    ctx.lineWidth   = 1;
-    ctx.shadowBlur  = 4;
-    ctx.shadowColor = '#ffffff';
-    ctx.beginPath();
-    for(let k = 0; k < 6; k++){
-      const ang = (k / 6) * Math.PI * 2 + this.age * 0.018;
-      const px  = x + Math.cos(ang) * this.r * 0.55;
-      const py  = y + Math.sin(ang) * this.r * 0.55;
-      k === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
-    }
-    ctx.closePath();
-    ctx.stroke();
-
-    // Inner rings
-    [0.65, 0.38].forEach(f => {
-      ctx.globalAlpha  = 0.2;
-      ctx.strokeStyle  = p.color;
-      ctx.lineWidth    = 2;
+    if(!GAME.perfMode){
+      // Hexagonal inner pattern
+      ctx.globalAlpha = 0.35;
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth   = 1;
+      ctx.shadowBlur  = 4;
+      ctx.shadowColor = '#ffffff';
       ctx.beginPath();
-      ctx.arc(x, y, this.r * f, 0, Math.PI * 2);
+      for(let k = 0; k < 6; k++){
+        const ang = (k / 6) * Math.PI * 2 + this.age * 0.018;
+        const px  = x + Math.cos(ang) * this.r * 0.55;
+        const py  = y + Math.sin(ang) * this.r * 0.55;
+        k === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+      }
+      ctx.closePath();
       ctx.stroke();
-    });
+
+      [0.65, 0.38].forEach(f => {
+        ctx.globalAlpha = 0.2;
+        ctx.strokeStyle = p.color;
+        ctx.lineWidth   = 2;
+        ctx.beginPath();
+        ctx.arc(x, y, this.r * f, 0, Math.PI * 2);
+        ctx.stroke();
+      });
+    }
 
     ctx.restore();
   }
 }
 
-// ── Arrow projectile ──────────────────────────────────────────
+// ── Arrow ─────────────────────────────────────────────────────
 class Arrow {
   constructor(pid, x, y){
     this.pid    = pid;
@@ -364,50 +421,56 @@ class Arrow {
     this.y      = y;
     this.vx     = CFG.ARROW_SPEED * (pid === 1 ? 1 : -1);
     this.alive  = true;
+    this.hasHit = false;  // FIX: single-hit flag
     this.trails = [];
     this.type   = 'ARROW';
   }
 
   update(){
+    if(!this.alive) return;
     this.x += this.vx;
     this.trails.push({ x: this.x, y: this.y });
-    if(this.trails.length > 18) this.trails.shift();
+    const maxTrail = GAME.perfMode ? 8 : 18;
+    if(this.trails.length > maxTrail) this.trails.shift();
     if(this.x < 0 || this.x > canvas.width){ this.alive = false; return; }
 
-    const opp = P[this.pid === 1 ? 2 : 1];
-    if(opp.handPos){
-      if(Math.hypot(this.x - opp.handPos.x, this.y - opp.handPos.y) < 58){
-        if(opp.isShield){
-          spawnRing(this.x, this.y, opp.color, 38, true);
-        } else {
-          hitPlayer(opp, CFG.ARROW_DAMAGE, P[this.pid].color);
-          spawnRing(this.x, this.y, P[this.pid].color, 50, false);
+    // FIX: check hasHit before damage to prevent multi-hit
+    if(!this.hasHit && GAME.damageEnabled){
+      const opp = P[this.pid === 1 ? 2 : 1];
+      if(opp.handPos){
+        if(Math.hypot(this.x - opp.handPos.x, this.y - opp.handPos.y) < 58){
+          this.hasHit = true;
+          this.alive  = false;  // FIX: immediately kill arrow on hit
+          if(opp.isShield){
+            spawnRing(this.x, this.y, opp.color, 38, true);
+          } else {
+            hitPlayer(opp, CFG.ARROW_DAMAGE, P[this.pid].color);
+            spawnRing(this.x, this.y, P[this.pid].color, 50, false);
+          }
         }
-        this.alive = false;
       }
     }
   }
 
   draw(){
+    if(!this.alive) return;
     const col = P[this.pid].color;
     ctx.save();
 
-    // Energy trail
     for(let i = 0; i < this.trails.length; i++){
       const t = this.trails[i];
       const a = i / this.trails.length;
       ctx.globalAlpha = a * 0.65;
       ctx.fillStyle   = col;
-      ctx.shadowBlur  = 10;
+      ctx.shadowBlur  = GAME.perfMode ? 4 : 10;
       ctx.shadowColor = col;
       ctx.beginPath();
       ctx.arc(t.x, t.y, a * 5, 0, Math.PI * 2);
       ctx.fill();
     }
 
-    // Arrow head glow
     ctx.globalAlpha = 1;
-    ctx.shadowBlur  = 20;
+    ctx.shadowBlur  = GAME.perfMode ? 8 : 20;
     ctx.shadowColor = col;
     ctx.strokeStyle = col;
     ctx.lineWidth   = 3;
@@ -415,8 +478,7 @@ class Arrow {
     ctx.arc(this.x, this.y, 10, 0, Math.PI * 2);
     ctx.stroke();
 
-    // Bright core
-    ctx.shadowBlur  = 8;
+    ctx.shadowBlur  = GAME.perfMode ? 4 : 8;
     ctx.shadowColor = '#ffffff';
     ctx.fillStyle   = '#ffffff';
     ctx.beginPath();
@@ -444,7 +506,7 @@ class Shockwave {
     this.r += 11;
     if(this.r > this.maxR){ this.alive = false; return; }
 
-    if(!this.hasHit){
+    if(!this.hasHit && GAME.damageEnabled){
       const opp = P[this.pid === 1 ? 2 : 1];
       if(opp.handPos){
         const d = Math.hypot(opp.handPos.x - this.cx, opp.handPos.y - this.cy);
@@ -465,10 +527,8 @@ class Shockwave {
     const col   = P[this.pid].color;
     const alpha = Math.max(0, 1 - this.r / this.maxR);
     ctx.save();
-    ctx.globalAlpha = alpha;
 
-    // Thick outer glow
-    ctx.shadowBlur  = 18;
+    ctx.shadowBlur  = GAME.perfMode ? 8 : 18;
     ctx.shadowColor = col;
     ctx.strokeStyle = col;
     ctx.lineWidth   = 14;
@@ -477,31 +537,29 @@ class Shockwave {
     ctx.arc(this.cx, this.cy, this.r, 0, Math.PI * 2);
     ctx.stroke();
 
-    // Bright ring
     ctx.lineWidth   = 4;
     ctx.globalAlpha = alpha * 0.9;
     ctx.stroke();
 
-    // Inner highlight
     ctx.strokeStyle = '#ffffff';
     ctx.lineWidth   = 1.5;
     ctx.globalAlpha = alpha * 0.45;
-    ctx.shadowBlur  = 4;
+    ctx.shadowBlur  = GAME.perfMode ? 2 : 4;
     ctx.stroke();
 
     ctx.restore();
   }
 }
 
-// ── Power Beam ────────────────────────────────────────────────
+// ── PowerBeam ─────────────────────────────────────────────────
 class PowerBeam {
   constructor(pid, y){
     this.pid      = pid;
     this.y        = y;
     this.age      = 0;
     this.alive    = true;
-    this.hitDone  = false;
-    this.w        = 22;        // beam width (pulses)
+    this.hitDone  = false;  // FIX: single-hit guaranteed
+    this.w        = 22;
     this.type     = 'BEAM';
   }
 
@@ -510,8 +568,9 @@ class PowerBeam {
     if(this.age > CFG.BEAM_FRAMES){ this.alive = false; return; }
     this.w = 20 + Math.sin(this.age * 0.28) * 12;
 
-    // Deal damage at midpoint of beam
-    if(!this.hitDone && this.age === Math.floor(CFG.BEAM_FRAMES * 0.45)){
+    // FIX: check damageEnabled + hitDone ensures exactly one damage event
+    if(!this.hitDone && GAME.damageEnabled &&
+       this.age === Math.floor(CFG.BEAM_FRAMES * 0.45)){
       const opp = P[this.pid === 1 ? 2 : 1];
       if(opp.isShield && opp.handPos){
         spawnRing(opp.handPos.x, opp.handPos.y, opp.color, 90, true);
@@ -530,13 +589,13 @@ class PowerBeam {
     const endX   = this.pid === 1 ? canvas.width : 0;
     ctx.save();
 
-    // Wide energy glow
     const grad = ctx.createLinearGradient(startX, 0, endX, 0);
     grad.addColorStop(0,   p.color);
     grad.addColorStop(0.5, '#ffffff');
     grad.addColorStop(1,   p.color);
+
     ctx.globalAlpha = alpha * 0.28;
-    ctx.shadowBlur  = 40;
+    ctx.shadowBlur  = GAME.perfMode ? 16 : 40;
     ctx.shadowColor = p.color;
     ctx.strokeStyle = p.color;
     ctx.lineWidth   = this.w + 30;
@@ -546,18 +605,16 @@ class PowerBeam {
     ctx.lineTo(endX, this.y);
     ctx.stroke();
 
-    // Mid colored core
     ctx.globalAlpha = alpha * 0.7;
     ctx.strokeStyle = grad;
     ctx.lineWidth   = this.w;
-    ctx.shadowBlur  = 20;
+    ctx.shadowBlur  = GAME.perfMode ? 8 : 20;
     ctx.stroke();
 
-    // Bright white core
     ctx.globalAlpha = alpha;
     ctx.strokeStyle = '#ffffff';
     ctx.lineWidth   = this.w * 0.3;
-    ctx.shadowBlur  = 6;
+    ctx.shadowBlur  = GAME.perfMode ? 2 : 6;
     ctx.shadowColor = '#ffffff';
     ctx.stroke();
 
@@ -565,7 +622,7 @@ class PowerBeam {
   }
 }
 
-// ── Hit Ring (impact flash) ───────────────────────────────────
+// ── HitRing ───────────────────────────────────────────────────
 class HitRing {
   constructor(x, y, color, maxR, blocked){
     this.x = x; this.y = y; this.color = color;
@@ -577,7 +634,7 @@ class HitRing {
     const a = 1 - this.r / this.maxR;
     ctx.save();
     ctx.globalAlpha = a;
-    ctx.shadowBlur  = 14;
+    ctx.shadowBlur  = GAME.perfMode ? 6 : 14;
     ctx.shadowColor = this.color;
     ctx.strokeStyle = this.color;
     ctx.lineWidth   = this.blocked ? 5 : 3;
@@ -593,18 +650,110 @@ class HitRing {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// HELPERS
-// ═══════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
+//  SECTION 7 · ROUND SYSTEM
+// ════════════════════════════════════════════════════════════════
+
+/**
+ * Called when a player's HP hits 0.
+ * Triggers ROUND_END → eventually GAMEOVER or next round.
+ */
+function endRound(roundWinnerPid){
+  if(GAME.state === 'ROUND_END' || GAME.state === 'GAMEOVER') return;
+
+  GAME.state       = 'ROUND_END';
+  GAME.roundWinner = roundWinnerPid;
+  GAME.roundEndFrame = GAME.frame;
+
+  // Tally round win
+  if(roundWinnerPid === 1) GAME.player1RoundsWon++;
+  else                      GAME.player2RoundsWon++;
+
+  // Freeze all weapons + projectiles immediately
+  projectiles = [];
+  effects     = [];
+  [1,2].forEach(pid => { P[pid].weapon = null; });
+
+  GAME.shake = 18;
+  GAME.flash = { alpha: 0.6, color: P[roundWinnerPid].color };
+}
+
+/**
+ * Advance to the next round or declare match winner.
+ */
+function nextRoundOrEnd(){
+  const rw  = GAME.player1RoundsWon;
+  const r2  = GAME.player2RoundsWon;
+  const need = CFG.ROUNDS_TO_WIN;
+
+  if(rw >= need || r2 >= need){
+    // Match over
+    GAME.state  = 'GAMEOVER';
+    GAME.winner = rw >= need ? 1 : 2;
+  } else {
+    // Start next round
+    GAME.roundNumber++;
+    resetRound();
+    startCountdown();
+  }
+}
+
+/**
+ * Reset per-round state (HP, projectiles, cooldowns) but NOT round scores.
+ */
+function resetRound(){
+  [1,2].forEach(pid => {
+    P[pid].hp       = CFG.START_HP;
+    P[pid].weapon   = null;
+    P[pid].lastSword = 0;
+    P[pid].arrowCD  = 0;
+    P[pid].shockCD  = 0;
+    P[pid].beamCD   = 0;
+  });
+  projectiles = [];
+  effects     = [];
+  GAME.shake  = 0;
+  GAME.flash.alpha = 0;
+  GAME.roundWinner = null;
+  GAME.damageEnabled = false;
+}
+
+/**
+ * Full match reset (called from GAMEOVER restart gesture).
+ */
+function resetMatch(){
+  GAME.roundNumber      = 1;
+  GAME.player1RoundsWon = 0;
+  GAME.player2RoundsWon = 0;
+  GAME.winner           = null;
+  resetRound();
+  startCountdown();
+}
+
+/**
+ * Begin the pre-round countdown (3-2-1-FIGHT).
+ */
+function startCountdown(){
+  GAME.state              = 'COUNTDOWN';
+  GAME.countdownValue     = CFG.COUNTDOWN_START;
+  GAME.countdownTimer     = 75;  // ~1.25 sec per step at 60fps
+  GAME.fightDisplayFrames = 0;
+  GAME.damageEnabled      = false;
+}
+
+// ════════════════════════════════════════════════════════════════
+//  SECTION 8 · EFFECTS & HELPERS
+// ════════════════════════════════════════════════════════════════
 
 function hitPlayer(player, dmg, col){
   if(GAME.state !== 'PLAYING') return;
-  player.hp   = Math.max(0, player.hp - dmg);
-  GAME.shake  = 13;
-  GAME.flash  = { alpha: 0.38, color: col };
+  if(!GAME.damageEnabled) return;
+  // FIX: hard-clamp HP to prevent going below 0
+  player.hp = Math.max(0, player.hp - dmg);
+  GAME.shake = 13;
+  GAME.flash = { alpha: 0.38, color: col };
   if(player.hp <= 0){
-    GAME.state  = 'GAMEOVER';
-    GAME.winner = player.id === 1 ? 2 : 1;
+    endRound(player.id === 1 ? 2 : 1);
   }
 }
 
@@ -613,6 +762,7 @@ function spawnRing(x, y, color, maxR, blocked){
 }
 
 function tryArrow(pid){
+  if(!GAME.damageEnabled) return;
   const p   = P[pid];
   const now = performance.now();
   if(p.handPos && now - p.arrowCD > CFG.ARROW_FIRE_RATE){
@@ -622,6 +772,7 @@ function tryArrow(pid){
 }
 
 function tryShockwave(pid, cx, cy){
+  if(!GAME.damageEnabled) return;
   const p   = P[pid];
   const now = performance.now();
   if(now - p.shockCD > CFG.SHOCK_CD){
@@ -633,6 +784,7 @@ function tryShockwave(pid, cx, cy){
 }
 
 function tryBeam(pid, y){
+  if(!GAME.damageEnabled) return;
   const p   = P[pid];
   const now = performance.now();
   if(now - p.beamCD > CFG.BEAM_CD){
@@ -643,38 +795,36 @@ function tryBeam(pid, y){
   }
 }
 
-function resetGame(){
-  P[1].hp = P[2].hp = CFG.START_HP;
-  P[1].weapon = P[2].weapon = null;
-  P[1].lastSword = P[2].lastSword = 0;
-  P[1].arrowCD   = P[2].arrowCD   = 0;
-  P[1].shockCD   = P[2].shockCD   = 0;
-  P[1].beamCD    = P[2].beamCD    = 0;
-  projectiles = []; effects = [];
-  GAME.state = 'PLAYING'; GAME.winner = null;
-  GAME.shake = 0; GAME.flash.alpha = 0;
-}
-
-// ═══════════════════════════════════════════════════════════════
-// MEDIAPIPE HAND TRACKING
-// ═══════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
+//  SECTION 9 · MEDIAPIPE HAND TRACKING
+// ════════════════════════════════════════════════════════════════
 
 const hands = new Hands({
   locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`
 });
 
 hands.setOptions({
-  maxNumHands            : 4,    // up to 2 per player
-  modelComplexity        : 0,    // 0 = lite model (faster)
+  maxNumHands            : 4,
+  modelComplexity        : 0,    // Lite model (faster)
   minDetectionConfidence : 0.7,
   minTrackingConfidence  : 0.5,
 });
 
 hands.onResults(onResults);
 
-// Called each camera frame with MediaPipe hand landmark results
+/**
+ * Called each camera frame with MediaPipe hand results.
+ *
+ * CAMERA MIRROR FIX:
+ *   MediaPipe receives the raw (un-mirrored) video feed.
+ *   Player assignment uses RAW coords:  wrist.x < 0.5 → P1 (left of real camera)
+ *   The game logic zones (hit detection, hand positions) stay in RAW coordinate space.
+ *   ONLY the video DISPLAY is mirrored via ctx.scale(-1,1) in drawBackground().
+ *   This means:
+ *     - Players feel natural (moving left feels left in the mirror)
+ *     - Zone assignment is still correct for the physical left/right split
+ */
 function onResults(res){
-  // Clear player hand data
   P[1].lm = P[1].lm2 = P[2].lm = P[2].lm2 = null;
 
   if(!res.multiHandLandmarks || res.multiHandLandmarks.length === 0){
@@ -683,11 +833,9 @@ function onResults(res){
     return;
   }
 
-  // Assign each detected hand to a player based on wrist X position:
-  //   wrist.x < 0.5  →  Player 1 (left half of raw video feed)
-  //   wrist.x >= 0.5 →  Player 2 (right half)
+  // Assign each hand to a player based on RAW wrist X position
   res.multiHandLandmarks.forEach(lm => {
-    const wx = lm[0].x;
+    const wx = lm[0].x;   // 0 = camera-left, 1 = camera-right (raw, not mirrored)
     if(wx < 0.5){
       if(!P[1].lm) P[1].lm = lm; else P[1].lm2 = lm;
     } else {
@@ -705,19 +853,23 @@ function processPlayer(pid){
   const lm2 = p.lm2;
 
   if(!lm){
-    p.handPos = null;
-    p.gesture = 'NONE';
+    p.handPos  = null;
+    p.gesture  = 'NONE';
     p.isShield = false;
+    // FIX: clean up weapon on hand-lost
     p.weapon   = null;
     return;
   }
 
-  // Primary wrist → canvas coordinates
+  // Primary wrist → canvas coords (LOGICAL, un-mirrored space)
   p.handPos = { x: lm[0].x * canvas.width, y: lm[0].y * canvas.height };
-  p.gesture = detectGesture(lm);
+
+  // Stabilised gesture
+  const rawGesture = detectGesture(lm);
+  p.gesture = stableGesture(pid, rawGesture);
   p.isShield = (p.gesture === 'PALM');
 
-  // ── Two-hand specials (clap / power blast) ──────────────────
+  // Two-hand specials
   if(lm2){
     const w1 = { x: lm[0].x  * canvas.width, y: lm[0].y  * canvas.height };
     const w2 = { x: lm2[0].x * canvas.width, y: lm2[0].y * canvas.height };
@@ -727,19 +879,17 @@ function processPlayer(pid){
 
     if(dist < CFG.CLAP_DIST){
       if(p.gesture === 'PALM' && g2 === 'PALM'){
-        // Both open palms close together → Power Blast Beam
         tryBeam(pid, mid.y);
       } else {
-        // Any clap gesture → Shockwave
+        // FIX: only try shockwave when damage is enabled to prevent shockwave spam on start
         tryShockwave(pid, mid.x, mid.y);
       }
     }
-
-    // Keep shielding if either hand is open
     if(g2 === 'PALM') p.isShield = true;
   }
 
-  // ── Single-hand weapon assignment ──────────────────────────
+  // Single-hand weapon assignment
+  // FIX: only create a new weapon instance if type changed (prevents constant re-init)
   if(p.gesture === 'FIST'){
     if(!p.weapon || p.weapon.type !== 'SWORD') p.weapon = new Sword(pid);
   } else if(p.gesture === 'PALM'){
@@ -752,84 +902,104 @@ function processPlayer(pid){
   }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// CAMERA
-// ═══════════════════════════════════════════════════════════════
-const camera = new Camera(video, {
-  onFrame: async () => { await hands.send({ image: video }); },
-  width: 1280, height: 720,
-});
-camera.start().then(() => {
-  loadEl.style.display = 'none';
-}).catch(err => {
-  loadEl.innerHTML = `<span style="color:#f55">Webcam error: ${err.message}</span>
-    <p>Please allow camera access and reload the page.</p>`;
-});
+// ════════════════════════════════════════════════════════════════
+//  SECTION 10 · PERFORMANCE MONITOR
+// ════════════════════════════════════════════════════════════════
+function updateFPS(){
+  const now = performance.now();
+  GAME.frameTimings.push(now);
+  // Keep a 1-second window
+  while(GAME.frameTimings.length > 1 &&
+        GAME.frameTimings[GAME.frameTimings.length - 1] - GAME.frameTimings[0] > 1000){
+    GAME.frameTimings.shift();
+  }
+  GAME.fps = GAME.frameTimings.length;
+  // Toggle perf mode
+  GAME.perfMode = GAME.fps < CFG.PERF_FPS_TARGET;
+}
 
-// ═══════════════════════════════════════════════════════════════
-// RENDERING
-// ═══════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
+//  SECTION 11 · RENDERING
+// ════════════════════════════════════════════════════════════════
 
+/**
+ * Draw the arena background.
+ *
+ * CAMERA MIRROR IMPLEMENTATION:
+ *   We apply ctx.scale(-1, 1) + ctx.translate(-W, 0) ONLY for the video frame draw.
+ *   All other rendering (weapons, UI, hands) uses normal coordinates.
+ *   This mirrors only the VISUAL camera feed — not the gameplay coordinate system.
+ */
 function drawBackground(){
+  const W = canvas.width;
+  const H = canvas.height;
+
   // Dark gradient arena
-  const g = ctx.createLinearGradient(0, 0, 0, canvas.height);
+  const g = ctx.createLinearGradient(0, 0, 0, H);
   g.addColorStop(0, '#090918');
   g.addColorStop(1, '#030310');
   ctx.fillStyle = g;
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillRect(0, 0, W, H);
 
-  // Dim camera feed overlay
-  ctx.save();
-  ctx.globalAlpha = 0.13;
-  if(video.readyState >= 2) ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-  ctx.restore();
+  // ── MIRRORED VIDEO DISPLAY ──────────────────────────────────
+  // scale(-1,1) flips horizontally around x=0, so we also translate(-W,0)
+  // to bring it back into view.
+  // This ONLY affects the video pixel draw — we save/restore ctx state.
+  if(video.readyState >= 2){
+    ctx.save();
+    ctx.globalAlpha = 0.13;
+    // Mirror transform: flip around the canvas centre-X
+    ctx.translate(W, 0);
+    ctx.scale(-1, 1);
+    ctx.drawImage(video, 0, 0, W, H);
+    ctx.restore();
+  }
 
-  // Player 1 (left) zone tint
+  // Player zone tints (unchanged — logical space)
   ctx.save();
-  const zg1 = ctx.createLinearGradient(0, 0, canvas.width * 0.42, 0);
+  const zg1 = ctx.createLinearGradient(0, 0, W * 0.42, 0);
   zg1.addColorStop(0, P[1].color + '1a');
   zg1.addColorStop(1, 'transparent');
   ctx.fillStyle = zg1;
-  ctx.fillRect(0, 0, canvas.width / 2, canvas.height);
+  ctx.fillRect(0, 0, W / 2, H);
 
-  // Player 2 (right) zone tint
-  const zg2 = ctx.createLinearGradient(canvas.width, 0, canvas.width * 0.58, 0);
+  const zg2 = ctx.createLinearGradient(W, 0, W * 0.58, 0);
   zg2.addColorStop(0, P[2].color + '1a');
   zg2.addColorStop(1, 'transparent');
   ctx.fillStyle = zg2;
-  ctx.fillRect(canvas.width / 2, 0, canvas.width / 2, canvas.height);
+  ctx.fillRect(W / 2, 0, W / 2, H);
   ctx.restore();
 
-  // Center dashed divider
+  // Center divider
   ctx.save();
   ctx.strokeStyle = 'rgba(255,255,255,0.07)';
   ctx.lineWidth   = 2;
   ctx.setLineDash([28, 14]);
   ctx.beginPath();
-  ctx.moveTo(canvas.width / 2, 0);
-  ctx.lineTo(canvas.width / 2, canvas.height);
+  ctx.moveTo(W / 2, 0);
+  ctx.lineTo(W / 2, H);
   ctx.stroke();
   ctx.setLineDash([]);
   ctx.restore();
 
-  // Floor glow strip
+  // Floor glow
   ctx.save();
-  const fl = ctx.createLinearGradient(0, 0, canvas.width, 0);
+  const fl = ctx.createLinearGradient(0, 0, W, 0);
   fl.addColorStop(0,   P[1].color + 'cc');
   fl.addColorStop(0.5, 'rgba(200,200,255,0.4)');
   fl.addColorStop(1,   P[2].color + 'cc');
   ctx.strokeStyle = fl;
   ctx.lineWidth   = 2;
-  ctx.shadowBlur  = 18;
+  ctx.shadowBlur  = GAME.perfMode ? 8 : 18;
   ctx.shadowColor = '#6688ff';
   ctx.beginPath();
-  ctx.moveTo(0, canvas.height - 2);
-  ctx.lineTo(canvas.width, canvas.height - 2);
+  ctx.moveTo(0, H - 2);
+  ctx.lineTo(W, H - 2);
   ctx.stroke();
   ctx.restore();
 }
 
-// Draw MediaPipe hand skeleton for visual feedback
+// Draw MediaPipe hand skeleton
 function drawSkeleton(lm, color, alpha){
   if(!lm) return;
   const CONN = [
@@ -844,7 +1014,7 @@ function drawSkeleton(lm, color, alpha){
   ctx.globalAlpha = alpha;
   ctx.strokeStyle = color;
   ctx.lineWidth   = 1.5;
-  ctx.shadowBlur  = 6;
+  ctx.shadowBlur  = GAME.perfMode ? 2 : 6;
   ctx.shadowColor = color;
   CONN.forEach(([a,b]) => {
     ctx.beginPath();
@@ -861,6 +1031,7 @@ function drawSkeleton(lm, color, alpha){
   ctx.restore();
 }
 
+// ── HUD ───────────────────────────────────────────────────────
 function drawHUD(){
   const W   = canvas.width;
   const bw  = Math.min(W * 0.33, 380);
@@ -871,44 +1042,44 @@ function drawHUD(){
     const p   = P[pid];
     const isL = pid === 1;
     const bx  = isL ? pad : W - pad - bw;
-    const by  = pad;
+    const by  = pad + 28;   // shift down to make room for round display
     const pct = p.hp / p.maxHp;
 
-    // Background panel
     ctx.save();
     ctx.fillStyle = 'rgba(0,0,0,0.55)';
     ctx.fillRect(bx - 6, by - 6, bw + 12, bh + 38);
 
-    // HP bar fill — green → yellow → red
     const hpCol = pct > 0.5 ? '#00ef88' : pct > 0.25 ? '#ffcc00' : '#ff2200';
-    ctx.shadowBlur  = 10;
+    ctx.shadowBlur  = GAME.perfMode ? 4 : 10;
     ctx.shadowColor = hpCol;
     ctx.fillStyle   = hpCol;
-    ctx.fillRect(bx, by, bw * pct, bh);
 
-    // HP bar border
-    ctx.shadowBlur  = 6;
+    // Low HP heartbeat zoom effect via bar height pulse
+    const hpBh = pct <= CFG.LOW_HP_THRESHOLD / CFG.START_HP
+      ? bh + Math.sin(GAME.frame * 0.22) * 3
+      : bh;
+
+    ctx.fillRect(bx, by, bw * pct, hpBh);
+
+    ctx.shadowBlur  = GAME.perfMode ? 3 : 6;
     ctx.shadowColor = p.color;
     ctx.strokeStyle = p.color;
     ctx.lineWidth   = 2;
     ctx.strokeRect(bx, by, bw, bh);
 
-    // HP number centred on bar
     ctx.shadowBlur  = 0;
     ctx.font        = 'bold 11px "Courier New",monospace';
     ctx.fillStyle   = '#ffffff';
     ctx.textAlign   = 'center';
     ctx.fillText(`${Math.ceil(p.hp)} / ${p.maxHp}`, bx + bw / 2, by + bh - 5);
 
-    // Player label
     ctx.font        = 'bold 13px "Courier New",monospace';
     ctx.fillStyle   = p.color;
-    ctx.shadowBlur  = 8;
+    ctx.shadowBlur  = GAME.perfMode ? 4 : 8;
     ctx.shadowColor = p.color;
     ctx.textAlign   = isL ? 'left' : 'right';
     ctx.fillText(`PLAYER ${pid}`, isL ? bx : bx + bw, by + bh + 18);
 
-    // Active gesture icon
     const icons = { FIST:'⚔', PALM:'🛡', POINT:'↗', NONE:'' };
     ctx.font        = '17px Arial';
     ctx.shadowBlur  = 0;
@@ -916,20 +1087,78 @@ function drawHUD(){
     ctx.fillStyle   = '#ffffff';
     ctx.fillText(icons[p.gesture] || '', isL ? bx + bw - 4 : bx + 4, by + bh - 3);
 
+    // LOW HEALTH text warning
+    if(pct <= CFG.LOW_HP_THRESHOLD / CFG.START_HP){
+      const pulseAlpha = 0.6 + Math.sin(GAME.frame * 0.28) * 0.4;
+      ctx.globalAlpha = pulseAlpha;
+      ctx.font        = 'bold 10px "Courier New",monospace';
+      ctx.fillStyle   = '#ff2200';
+      ctx.shadowBlur  = 10;
+      ctx.shadowColor = '#ff2200';
+      ctx.textAlign   = isL ? 'left' : 'right';
+      ctx.fillText('LOW HEALTH', isL ? bx : bx + bw, by - 8);
+    }
+
     ctx.restore();
   });
+
+  // Round display at very top-centre
+  drawRoundDisplay();
 
   // VS badge
   ctx.save();
   ctx.font      = 'bold 13px "Courier New",monospace';
   ctx.fillStyle = 'rgba(255,255,255,0.18)';
   ctx.textAlign = 'center';
-  ctx.fillText('VS', W / 2, pad + bh - 5);
+  ctx.fillText('VS', W / 2, pad + 28 + bh - 5);
+  ctx.restore();
+}
+
+function drawRoundDisplay(){
+  const W = canvas.width;
+  ctx.save();
+
+  // Round label
+  ctx.font        = 'bold 14px "Courier New",monospace';
+  ctx.fillStyle   = 'rgba(255,255,255,0.8)';
+  ctx.textAlign   = 'center';
+  ctx.shadowBlur  = 8;
+  ctx.shadowColor = '#ffffff';
+  ctx.fillText(`ROUND ${GAME.roundNumber}`, W / 2, 18);
+
+  // Round score dots  ● ● ○
+  const dotR    = 6;
+  const dotGap  = 18;
+  const totalDots = CFG.ROUNDS_TO_WIN;
+
+  // P1 dots (left of centre)
+  for(let i = 0; i < totalDots; i++){
+    const won = i < GAME.player1RoundsWon;
+    const cx  = W / 2 - 60 - (totalDots - 1 - i) * dotGap;
+    ctx.beginPath();
+    ctx.arc(cx, 15, dotR, 0, Math.PI * 2);
+    ctx.fillStyle   = won ? P[1].color : 'rgba(255,255,255,0.15)';
+    ctx.shadowBlur  = won ? 10 : 0;
+    ctx.shadowColor = P[1].color;
+    ctx.fill();
+  }
+
+  // P2 dots (right of centre)
+  for(let i = 0; i < totalDots; i++){
+    const won = i < GAME.player2RoundsWon;
+    const cx  = W / 2 + 60 + i * dotGap;
+    ctx.beginPath();
+    ctx.arc(cx, 15, dotR, 0, Math.PI * 2);
+    ctx.fillStyle   = won ? P[2].color : 'rgba(255,255,255,0.15)';
+    ctx.shadowBlur  = won ? 10 : 0;
+    ctx.shadowColor = P[2].color;
+    ctx.fill();
+  }
+
   ctx.restore();
 }
 
 function drawGestureHints(){
-  // Subtle labels near hand positions during play
   const icons = { FIST:'⚔ SWORD', PALM:'🛡 SHIELD', POINT:'↗ ARROW' };
   [1, 2].forEach(pid => {
     const p = P[pid];
@@ -937,7 +1166,7 @@ function drawGestureHints(){
     ctx.save();
     ctx.font        = 'bold 14px Arial';
     ctx.fillStyle   = P[pid].color;
-    ctx.shadowBlur  = 12;
+    ctx.shadowBlur  = GAME.perfMode ? 6 : 12;
     ctx.shadowColor = P[pid].color;
     ctx.textAlign   = 'center';
     ctx.globalAlpha = 0.75;
@@ -946,21 +1175,139 @@ function drawGestureHints(){
   });
 }
 
+// ── Low HP vignette ───────────────────────────────────────────
+function drawLowHPVignette(){
+  if(GAME.state !== 'PLAYING') return;
+  [1,2].forEach(pid => {
+    const p   = P[pid];
+    const pct = p.hp / p.maxHp;
+    if(pct > CFG.LOW_HP_THRESHOLD / CFG.START_HP) return;
+
+    const pulse = 0.15 + Math.abs(Math.sin(GAME.frame * 0.12)) * 0.25;
+    const W = canvas.width, H = canvas.height;
+    const side = pid === 1 ? 'left' : 'right';
+
+    ctx.save();
+    const grad = ctx.createRadialGradient(
+      pid === 1 ? 0 : W, H / 2, 0,
+      pid === 1 ? 0 : W, H / 2, W * 0.8
+    );
+    grad.addColorStop(0,   `rgba(180,0,0,${pulse})`);
+    grad.addColorStop(0.4, `rgba(120,0,0,${pulse * 0.5})`);
+    grad.addColorStop(1,   'rgba(0,0,0,0)');
+
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+    ctx.restore();
+  });
+}
+
+// ── Countdown overlay ─────────────────────────────────────────
+function drawCountdown(){
+  if(GAME.state !== 'COUNTDOWN') return;
+  const W  = canvas.width;
+  const cy = canvas.height / 2;
+
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.fillRect(0, 0, W, canvas.height);
+
+  const label = GAME.fightDisplayFrames > 0
+    ? 'FIGHT!'
+    : String(GAME.countdownValue);
+
+  const isFight = label === 'FIGHT!';
+  const fs = Math.max(72, Math.round(W * 0.13));
+
+  // Pop scale pulse
+  const pulse = isFight
+    ? 1 + Math.sin(GAME.fightDisplayFrames * 0.25) * 0.06
+    : 1 + Math.sin((75 - GAME.countdownTimer) * 0.12) * 0.04;
+
+  ctx.translate(W / 2, cy);
+  ctx.scale(pulse, pulse);
+
+  ctx.textAlign   = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font        = `bold ${fs}px "Courier New",monospace`;
+  ctx.shadowBlur  = isFight ? 80 : 50;
+  ctx.shadowColor = isFight ? '#ffffff' : '#ffcc00';
+  ctx.fillStyle   = isFight ? '#ffffff' : '#ffcc00';
+  ctx.fillText(label, 0, 0);
+
+  // Halo ring
+  ctx.globalAlpha = 0.2;
+  ctx.strokeStyle = isFight ? '#ffffff' : '#ffcc00';
+  ctx.lineWidth   = 8;
+  ctx.shadowBlur  = 30;
+  ctx.beginPath();
+  ctx.arc(0, 0, fs * 0.7 * pulse, 0, Math.PI * 2);
+  ctx.stroke();
+
+  ctx.restore();
+}
+
+// ── Round End overlay ─────────────────────────────────────────
+function drawRoundEnd(){
+  if(GAME.state !== 'ROUND_END') return;
+  const w   = GAME.roundWinner;
+  const col = P[w].color;
+  const W   = canvas.width;
+
+  // How far into the pause are we?
+  const elapsed = GAME.frame - GAME.roundEndFrame;
+  const alpha   = Math.min(1, elapsed / 20);   // fade in quickly
+
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle   = 'rgba(0,0,0,0.7)';
+  ctx.fillRect(0, 0, W, canvas.height);
+
+  const fs = Math.max(28, Math.round(W * 0.065));
+  ctx.font        = `bold ${fs}px "Courier New",monospace`;
+  ctx.textAlign   = 'center';
+  ctx.shadowBlur  = 60;
+  ctx.shadowColor = col;
+  ctx.fillStyle   = col;
+  ctx.fillText(`PLAYER ${w}`, W / 2, canvas.height / 2 - fs * 0.6);
+
+  ctx.shadowBlur  = 30;
+  ctx.fillStyle   = '#ffffff';
+  ctx.fillText(`WINS ROUND ${GAME.roundNumber}`, W / 2, canvas.height / 2 + fs * 0.6);
+
+  // K.O. text
+  ctx.font        = `bold ${Math.round(fs * 0.5)}px "Courier New",monospace`;
+  ctx.shadowBlur  = 20;
+  ctx.shadowColor = '#ff2200';
+  ctx.fillStyle   = '#ff4400';
+  ctx.fillText('K.O.', W / 2, canvas.height / 2 + fs * 1.6);
+
+  ctx.restore();
+
+  // Auto-advance after delay
+  if(elapsed > CFG.ROUND_RESET_DELAY){
+    nextRoundOrEnd();
+  }
+}
+
+// ── Waiting screen ────────────────────────────────────────────
 function drawWaiting(){
   if(GAME.state !== 'WAITING') return;
   const hasP1 = !!P[1].handPos;
   const hasP2 = !!P[2].handPos;
-  if(hasP1 && hasP2){ GAME.state = 'PLAYING'; return; }
+  if(hasP1 && hasP2){
+    // Both hands detected — start first round countdown
+    startCountdown();
+    return;
+  }
 
   const W  = canvas.width;
   const cy = canvas.height / 2;
 
-  // Overlay
   ctx.save();
   ctx.fillStyle = 'rgba(0,0,0,0.6)';
   ctx.fillRect(0, 0, W, canvas.height);
 
-  // Title
   const fs = Math.max(24, Math.round(W * 0.052));
   ctx.font        = `bold ${fs}px "Courier New",monospace`;
   ctx.textAlign   = 'center';
@@ -969,14 +1316,12 @@ function drawWaiting(){
   ctx.fillStyle   = '#ffffff';
   ctx.fillText('⚔  HAND COMBAT  ⚔', W / 2, cy - 90);
 
-  // Sub
   ctx.shadowBlur  = 0;
   ctx.font        = `${Math.max(13, Math.round(W * 0.017))}px Arial`;
   ctx.fillStyle   = 'rgba(180,210,255,0.75)';
   ctx.fillText('Both players stand in front of the webcam', W / 2, cy - 42);
   ctx.fillText('Player 1 → LEFT half    |    Player 2 → RIGHT half', W / 2, cy - 14);
 
-  // Gesture guide
   const guide = [
     ['✊  Fist',          '→  Summon Glowing Sword'],
     ['🖐  Open Palm',     '→  Raise Energy Shield'],
@@ -991,7 +1336,6 @@ function drawWaiting(){
     ctx.fillText(`${g}  ${a}`, W / 2, cy + 28 + i * 23);
   });
 
-  // Ready status
   [1, 2].forEach(pid => {
     const has = pid === 1 ? hasP1 : hasP2;
     const px  = pid === 1 ? W * 0.22 : W * 0.78;
@@ -1005,34 +1349,59 @@ function drawWaiting(){
   ctx.restore();
 }
 
+// ── Game Over screen ──────────────────────────────────────────
 function drawGameOver(){
   if(GAME.state !== 'GAMEOVER') return;
   const w   = GAME.winner;
   const col = P[w].color;
+  const W   = canvas.width;
 
   ctx.save();
-  ctx.fillStyle = 'rgba(0,0,0,0.8)';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = 'rgba(0,0,0,0.82)';
+  ctx.fillRect(0, 0, W, canvas.height);
 
-  const fs = Math.max(28, Math.round(canvas.width * 0.07));
+  const fs = Math.max(28, Math.round(W * 0.07));
   ctx.font        = `bold ${fs}px "Courier New",monospace`;
   ctx.textAlign   = 'center';
   ctx.shadowBlur  = 60;
   ctx.shadowColor = col;
   ctx.fillStyle   = col;
-  ctx.fillText(`PLAYER ${w} WINS!`, canvas.width / 2, canvas.height / 2 - 24);
+
+  // "WINNER" label above
+  ctx.font      = `bold ${Math.round(fs * 0.4)}px "Courier New",monospace`;
+  ctx.fillStyle = 'rgba(255,255,255,0.7)';
+  ctx.shadowBlur = 20;
+  ctx.shadowColor = '#ffffff';
+  ctx.fillText('WINNER', W / 2, canvas.height / 2 - fs * 1.4);
+
+  ctx.font        = `bold ${fs}px "Courier New",monospace`;
+  ctx.shadowBlur  = 60;
+  ctx.shadowColor = col;
+  ctx.fillStyle   = col;
+  ctx.fillText(`PLAYER ${w} WINS!`, W / 2, canvas.height / 2 - 24);
+
+  // Round score recap
+  const scoreFs = Math.max(14, Math.round(W * 0.02));
+  ctx.font      = `${scoreFs}px "Courier New",monospace`;
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  ctx.shadowBlur = 0;
+  ctx.fillText(
+    `P1: ${GAME.player1RoundsWon}  —  P2: ${GAME.player2RoundsWon}`,
+    W / 2, canvas.height / 2 + 32
+  );
 
   ctx.shadowBlur  = 15;
-  ctx.font        = `${Math.max(14, Math.round(canvas.width * 0.021))}px Arial`;
+  ctx.font        = `${Math.max(14, Math.round(W * 0.021))}px Arial`;
   ctx.fillStyle   = 'rgba(255,255,255,0.65)';
-  ctx.fillText('Make a FIST to play again', canvas.width / 2, canvas.height / 2 + 50);
+  ctx.fillText('Make a FIST to play again', W / 2, canvas.height / 2 + 70);
 
   ctx.restore();
 
-  // Winning player makes a fist to restart
-  if(P[w].gesture === 'FIST') resetGame();
+  // FIX: only winning player can restart (prevents accidental restart)
+  if(P[w].gesture === 'FIST') resetMatch();
 }
 
+// ── Screen FX (shake + flash + low HP effects) ────────────────
 function applyScreenFX(){
   // Screen shake
   if(GAME.shake > 0.5){
@@ -1043,7 +1412,7 @@ function applyScreenFX(){
     GAME.shake *= 0.78;
   } else { GAME.shake = 0; }
 
-  // Hit flash
+  // Hit flash overlay
   if(GAME.flash.alpha > 0.01){
     ctx.save();
     ctx.globalAlpha = GAME.flash.alpha;
@@ -1054,56 +1423,111 @@ function applyScreenFX(){
   }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// MAIN GAME LOOP — 60 FPS via requestAnimationFrame
-// ═══════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
+//  SECTION 12 · COUNTDOWN LOGIC (called in game loop)
+// ════════════════════════════════════════════════════════════════
+function updateCountdown(){
+  if(GAME.state !== 'COUNTDOWN') return;
+
+  // If FIGHT! is currently showing, count down its display frames
+  if(GAME.fightDisplayFrames > 0){
+    GAME.fightDisplayFrames--;
+    if(GAME.fightDisplayFrames === 0){
+      // Countdown fully complete — enter PLAYING
+      GAME.state         = 'PLAYING';
+      GAME.damageEnabled = true;
+    }
+    return;
+  }
+
+  GAME.countdownTimer--;
+  if(GAME.countdownTimer <= 0){
+    GAME.countdownValue--;
+    if(GAME.countdownValue <= 0){
+      // Switch to FIGHT! display
+      GAME.fightDisplayFrames = 60;  // show FIGHT for ~1 sec
+    } else {
+      GAME.countdownTimer = 75;  // next digit in ~1.25s
+    }
+  }
+}
+
+// ════════════════════════════════════════════════════════════════
+//  SECTION 13 · MAIN GAME LOOP
+// ════════════════════════════════════════════════════════════════
 function loop(){
   requestAnimationFrame(loop);
   GAME.frame++;
+  updateFPS();
 
   ctx.save();
 
   drawBackground();
   applyScreenFX();
 
-  // Draw hand skeletons (always, for player feedback)
+  // Hand skeletons always visible for player feedback
   drawSkeleton(P[1].lm,  P[1].color, 0.7);
   drawSkeleton(P[1].lm2, P[1].color, 0.35);
   drawSkeleton(P[2].lm,  P[2].color, 0.7);
   drawSkeleton(P[2].lm2, P[2].color, 0.35);
 
-  if(GAME.state === 'PLAYING'){
-    // Update + draw active weapons
+  // ── Active gameplay states ─────────────────────────────────
+  if(GAME.state === 'PLAYING' || GAME.state === 'COUNTDOWN'){
+    // Update weapons (but no damage during countdown)
     [1, 2].forEach(pid => {
       const p = P[pid];
       if(p.weapon){
         p.weapon.update();
         p.weapon.draw();
-        // Auto-drop weapon if gesture changed
+        // FIX: weapon cleanup when gesture changes
         if(p.weapon.type === 'SWORD'  && p.gesture !== 'FIST') p.weapon = null;
         if(p.weapon.type === 'SHIELD' && p.gesture !== 'PALM') p.weapon = null;
       }
     });
 
-    // Update + draw projectiles (arrows)
+    // Projectiles & effects (still render during countdown, just don't do damage)
     projectiles = projectiles.filter(a => a.alive);
     projectiles.forEach(a => { a.update(); a.draw(); });
 
-    // Update + draw effects (shockwave, beam, hit rings)
     effects = effects.filter(e => e.alive);
     effects.forEach(e => { e.update(); e.draw(); });
 
     drawGestureHints();
+    drawLowHPVignette();
     drawHUD();
   }
 
+  // Draw round-end weapons/effects (already cleared in endRound, but draw remaining)
+  if(GAME.state === 'ROUND_END'){
+    drawHUD();
+  }
+
+  // ── Overlay screens ────────────────────────────────────────
   drawWaiting();
+  updateCountdown();
+  drawCountdown();
+  drawRoundEnd();
   drawGameOver();
 
   ctx.restore();
 }
 
 loop();
+
+// ════════════════════════════════════════════════════════════════
+//  SECTION 14 · CAMERA / MEDIAPIPE INIT
+// ════════════════════════════════════════════════════════════════
+const camera = new Camera(video, {
+  onFrame: async () => { await hands.send({ image: video }); },
+  width: 1280, height: 720,
+});
+
+camera.start().then(() => {
+  loadEl.style.display = 'none';
+}).catch(err => {
+  loadEl.innerHTML = `<span style="color:#f55">Webcam error: ${err.message}</span>
+    <p>Please allow camera access and reload the page.</p>`;
+});
 </script>
 </body>
 </html>
